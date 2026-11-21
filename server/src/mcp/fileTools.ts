@@ -10,6 +10,7 @@ import type { Audit } from '../audit/audit.js';
 import type { VaultStore, Who, RevisionRow } from '../vault/store.js';
 import { MAX_CONTENT } from '../vault/store.js';
 import { authorize } from '../policy/engine.js';
+import { findPatch, withEol } from '../util/patchMatch.js';
 
 type Out = { text: string; data: Record<string, unknown> };
 type Reg = (name: string, description: string, shape: z.ZodRawShape, needsToken: boolean, fn: (ctx: any, a: any) => Promise<Out>) => void;
@@ -118,7 +119,7 @@ export function registerFileWriteTools(reg: Reg, d: FileToolDeps): void {
     return withHint(ctx, rel, `Updated ${path} (revision ${r.revision})`, { path, revision: r.revision, previous_revision: r.previous_revision });
   });
 
-  reg('file_patch', 'Edit a vault file with exact text replacements. Each edit\'s old text must occur exactly once (add context to make it unique). Edits apply in order.', {
+  reg('file_patch', 'Edit a vault file with exact text replacements. Each edit\'s old text must occur exactly once (add context to make it unique). A line break in it also matches a CRLF break and spaces at the end of that line, nothing else. Edits apply in order.', {
     path: z.string(), base_revision: BASE,
     edits: z.array(z.object({ old: z.string().min(1).max(MAX_CONTENT), new: z.string().max(MAX_CONTENT) })).min(1).max(50),
   }, true, async (ctx, a) => {
@@ -130,13 +131,12 @@ export function registerFileWriteTools(reg: Reg, d: FileToolDeps): void {
     if (cur.revision !== a.base_revision) await store.write(rel, cur.bytes, a.base_revision, 'patch', w); // records and throws the conflict
     let text = cur.bytes.toString('utf8');
     (a.edits as { old: string; new: string }[]).forEach((e, i) => {
-      const n = text.split(e.old).length - 1;
+      const m = findPatch(text, e.old), n = m.matches;
       if (n === 0) throw new ToolError('no_match', `edit ${i}: the old text was not found. Nothing was changed.`, { edit_index: i, matches: 0 });
       if (n > 1) throw new ToolError('ambiguous_match', `edit ${i}: the old text occurs ${n} times; include more surrounding text so it matches once. Nothing was changed.`, { edit_index: i, matches: n });
       const bad = textProblem(e.new);
       if (bad) throw new ToolError('invalid_argument', `edit ${i}: ${bad} Nothing was changed.`);
-      const at = text.indexOf(e.old);
-      text = text.slice(0, at) + e.new + text.slice(at + e.old.length);
+      text = text.slice(0, m.at) + withEol(e.new, m.eol) + text.slice(m.at + m.length);
     });
     checkText(text, 'patched file');
     const r = await store.write(rel, Buffer.from(text, 'utf8'), a.base_revision, 'patch', w);

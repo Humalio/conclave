@@ -4,6 +4,7 @@ import { promises as fs } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { OwnerScope } from '../policy/ownerScope.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { Db } from '../db/db.js';
 import type { RateLimit } from '../db/rateLimit.js';
@@ -147,6 +148,7 @@ export const compactHeader = (h: string | string[] | undefined): boolean => type
 /** client: the folder and session variable the headers helper reported (X-Agent-Hub-Folder, X-Agent-Hub-Session-Var), for alerts only. */
 export function buildMcpServer(deps: McpDeps, app: Credential, source: string | null, headerToken: string | null = null, headerSession: ReturnType<Keys['resolveToken']> | null = null, compactHeader = false, client: ClientHint | null = null): McpServer {
   const { keys, audit, guard, vault, db } = deps;
+  const listSession = headerSession; // the pipeline clears headerSession after the first call; the tool list keeps it
   const server = new McpServer({ name: 'conclave', version: HUB_VERSION }, { instructions: headerToken ? HEADER_INSTRUCTIONS : INSTRUCTIONS });
 
   const fail = (code: string, message: string, extra?: Record<string, unknown>): CallToolResult => ({
@@ -379,9 +381,13 @@ Known: ${known.id} – operator guidance (L0): ${known.guidance}`; extra = { ...
 
   const tokenField = z.string().optional().describe('The session_token returned by session_login');
   const toolNames = new Set<string>();
+  const tokenless = new Set<string>();
   const reg = (name: string, description: string, shape: z.ZodRawShape, needsToken: boolean, fn: (ctx: Ctx, a: any) => Promise<Out>) => {
     toolNames.add(name);
-    server.registerTool(name, { description, inputSchema: needsToken ? { session_token: tokenField, ...shape } : shape },
+    if (!needsToken) tokenless.add(name);
+    // A connection that signs in by header (the connector: X-Agent-Hub-Session) never needs session_token, so its schemas leave
+    // it out; the schema stays loose so a stray token still reaches the pipeline and a different one is refused.
+    server.registerTool(name, { description, inputSchema: !needsToken ? shape : headerToken ? z.object(shape).loose() : { session_token: tokenField, ...shape } },
       ((args: Record<string, unknown>) => pipeline(name, args, needsToken, fn)) as never);
   };
 
@@ -418,7 +424,7 @@ Known: ${known.id} – operator guidance (L0): ${known.guidance}`; extra = { ...
         let code = e.code;
         if (code === 'rate_limited') throw new ToolError('rate_limited', e.message);
         if (code === 'revoked' && keyId) {
-          const row = db.prepare('SELECT status_reason FROM credentials WHERE key_id=?').get(keyId) as { status_reason: string | null } | undefined;
+          const row = (db.prepare('SELECT status_reason FROM credentials WHERE key_id=?').get(keyId) ?? db.prepare('SELECT status_reason FROM key_tombstones WHERE key_id=?').get(keyId)) as { status_reason: string | null } | undefined;
           if (row?.status_reason === 'rotated') code = 'rotated';
         }
         deps.loginLimit.fail(app.id, 'login_fail', now);
@@ -748,7 +754,7 @@ Known: ${known.id} – operator guidance (L0): ${known.guidance}`; extra = { ...
     return { text: agents.length ? agents.map((x) => `${x.id}: ${x.label}${x.role ? `, ${x.role}` : ''}${x.links.length ? ` [${x.links.map((l) => l.kind).join(', ')}]` : ''}`).join('\n') : 'No agents you may message.', data: { agents } };
   });
 
-  reg('message_send', 'Send a message to one agent (to) or into a room (room_id). client_msg_id makes retries safe.', {
+  reg('message_send', 'Send a message to one agent (to) or into a room (room_id). client_msg_id makes retries safe. In a room only an @Label mention (the exact label) or a reply wakes an agent; a direct message wakes the other agent.', {
     to: z.string().max(100).optional(), room_id: z.string().max(100).optional(), body: z.string().min(1).describe(forOperator('The message.')),
     kind: z.enum(MESSAGE_KINDS).optional().describe('text (default), proposal, review_request, agreement or task_update: a label for readers; it grants nothing'), reply_to: z.string().max(100).optional(), client_msg_id: z.string().min(1).max(100),
   }, true, async (ctx, a) => {
@@ -951,5 +957,57 @@ Known: ${known.id} – operator guidance (L0): ${known.guidance}`; extra = { ...
     client: () => { const v = server.server.getClientVersion(); return v?.name ? { name: String(v.name), version: String(v.version ?? '') } : null; },
   });
 
+  if (listSession) listFor(server, listedTools(listSession));
   return server;
+
+  /**
+   * The tools a header session lists (docs/mcp.md, "What a session lists"): what the call gate in pipeline() could allow,
+   * and for a team tool that needs a role action, a team role that has it. Every tool stays registered, so a call to one
+   * left out gets the same refusal as before.
+   */
+  function listedTools(r: NonNullable<typeof headerSession>): string[] {
+    const rules = keys.rulesFor(r.credential.id), appCap = keys.rulesFor(app.id);
+    const cap = deps.ownerScope ? deps.ownerScope.cap(r.agent.id, appCap) : appCap;
+    const teams = [...new Set(rules.filter((x) => x.effect === 'allow' && x.resource.startsWith('team:')).map((x) => x.resource))];
+    let hw: boolean | undefined;
+    const offersHw = () => (hw ??= (() => { try { return deps.hardware.offers(r.agent.id); } catch { return true; } })());
+    const roleCan = new Map<string, boolean>();
+    const can = (action: string) => {
+      if (!roleCan.has(action)) roleCan.set(action, teams.some((t) => { try { return authorize(rules, cap, action, t).allowed; } catch { return true; } }));
+      return roleCan.get(action)!;
+    };
+    return [...toolNames].filter((name) => {
+      if (r.scope === 'turn' && TURN_DENIED.has(name)) return false;
+      if (name.startsWith('hw_') && !offersHw()) return false;
+      if (tokenless.has(name) || (BASE_TOOLS as readonly string[]).includes(name)) return true;
+      if ((DEFAULT_TOOLS as readonly string[]).includes(name)) return !explicitlyDenied(rules, cap, 'tool.invoke', `tool:${name}`);
+      if (!authorize(rules, cap, 'tool.invoke', `tool:${name}`).allowed) return false;
+      const action = ROLE_TOOLS[name];
+      return !action || can(action);
+    });
+  }
+}
+
+/** Team tools that only a role with this action can use (teams.ts ROLE_ACTIONS): a session lists them only with such a role. */
+const ROLE_TOOLS: Record<string, string> = {
+  task_create: 'task.create', task_update: 'task.create', task_assign: 'task.assign', task_claim: 'task.claim', task_review: 'task.review',
+  task_complete: 'task.complete', task_reopen: 'task.complete', task_block: 'task.block', task_cancel: 'task.block',
+  team_complete: 'team.complete', team_pause: 'team.complete', team_resume: 'team.complete', agent_reset: 'team.complete',
+  team_recruit: 'team.recruit', bp_report: 'team.report',
+};
+
+const digests = new WeakMap<McpServer, string>();
+/** The digest of the tools this server lists for its header session, sent as X-Agent-Hub-Tools; null without one. */
+export const toolsDigest = (server: McpServer): string | null => digests.get(server) ?? null;
+
+/** Narrows tools/list to these names, keeping the SDK's own answer (schemas, annotations) for each. */
+function listFor(server: McpServer, names: string[]): void {
+  const shown = new Set(names);
+  digests.set(server, sha256Hex(names.slice().sort().join(',')).slice(0, 16));
+  const inner = (server.server as unknown as { _requestHandlers: Map<string, (req: unknown, extra: unknown) => Promise<{ tools: { name: string }[] }>> })._requestHandlers.get('tools/list');
+  if (!inner) return;
+  server.server.setRequestHandler(ListToolsRequestSchema, (async (req: unknown, extra: unknown) => {
+    const res = await inner(req, extra);
+    return { ...res, tools: res.tools.filter((t) => shown.has(t.name)) };
+  }) as never);
 }

@@ -48,7 +48,7 @@ const CLAUDE_JSON_HOME = CLAUDE_JSON;
 const WIN = platform() === 'win32';
 const POLL_S = 45;
 const EXIT = { ok: 0, fail: 1, usage: 2, waiting: 3, changes: 4, closed: 5 };
-const SECRET_RE = /(ah_(app|ses)_[a-z2-7]{12}_\S+|cnv_enrol_[a-z2-7]{26}|cnv_key_[a-z2-7]{26})/gi;
+const SECRET_RE = /(ah_(app|ses)_[a-z2-7]{12}_\S+|cnv_enrol_[a-z2-7]{26}|cnc-pair-[a-z2-7]{26}|cnv_key_[a-z2-7]{26})/gi;
 
 // ───────────── output (never a secret) ─────────────
 const scrub = (s) => String(s).replace(SECRET_RE, '[redacted]');
@@ -220,7 +220,7 @@ async function enrol(flags) {
   if (!code) die(`No enrolment code: write it to ${CODE_FILE} with your file tool (or pass it on stdin with --stdin), then rerun.`, EXIT.usage);
   // A PC key set up by hand (not by this script) is not replaced silently: its agents would lose their logins.
   if (keys.get('AGENT_HUB_APP_KEY') && !(state.hub === hub && state.enrol?.keys_written) && !flags.replace) die('keys.env already holds an AGENT_HUB_APP_KEY that this script did not write. Enrolling replaces it, and agents that use it stop working. Rerun with --replace only if that is intended (for example a re-enrolled PC).');
-  if (!/^cnv_enrol_[a-z2-7]{26}$/.test(code)) die('The enrolment code does not look right (cnv_enrol_ and 26 characters). Copy it again from the prompt.', EXIT.usage);
+  if (!/^(?:cnc-pair-|cnv_enrol_)[a-z2-7]{26}$/.test(code)) die('The enrolment code does not look right (cnc-pair- and 26 characters). Copy it again from the prompt.', EXIT.usage);
 
   // Pin the CA: download it (public), check its fingerprint against the prompt, keep it as the only trusted root.
   if (u.protocol === 'https:') {

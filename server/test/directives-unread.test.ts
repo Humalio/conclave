@@ -101,6 +101,24 @@ describe('the unread-directives reminder', () => {
     expect(await whoamiCount(X.w.call)).toBe(1);
   });
 
+  it('a minor edit (a typo) asks no agent to read again, and cannot change the scope', async () => {
+    const X = await team();
+    const d1 = rule(X.id, 'Branch per taks');
+    ok(await X.w.call('directives_read', { unread: true, ack: true }));
+    const changed = () => (app.db.prepare("SELECT COUNT(*) n FROM agent_notices WHERE agent_id=? AND kind='directive_changed'").get(X.w.id) as { n: number }).n;
+    const before = changed();
+    const nd = app.directives.update(d1.id, { title: 'Branch per task', minor: true }, sys);
+    expect(nd.version).toBe(d1.version + 1);
+    expect(changed()).toBe(before);
+    expect(await whoamiCount(X.w.call)).toBe(0);
+    expect(ok(await X.w.call('work_next', { wait_seconds: 0 })).directives_unread).toBeUndefined();
+    expect(() => app.directives.update(d1.id, { scope: { kind: 'hub', ref: null }, minor: true }, sys)).toThrow(/cannot be a minor edit/);
+    // A normal edit still asks again.
+    app.directives.update(d1.id, { body: 'Each task on its own branch.' }, sys);
+    expect(changed()).toBe(before + 1);
+    expect(await whoamiCount(X.w.call)).toBe(1);
+  });
+
   it('leaves out a directive an exemption keeps off the agent', async () => {
     const X = await team();
     const a = rule(X.id, 'Kept off the worker'), b = rule(X.id, 'In force');

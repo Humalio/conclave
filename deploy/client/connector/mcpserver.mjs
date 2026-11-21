@@ -96,6 +96,9 @@ export async function runMcp(folderArg, { home, input = process.stdin, output = 
   // Codex gets the one reminder line at the start of each woken turn (docs/connector.md): a woken turn is a new process,
   // so the first tool result of this process carries it. Claude Code has the folder hook instead.
   let codexClient = false, lineDone = false;
+  // The digest of the tools the client last listed: when an answer carries another one, the client is told to list again
+  // (docs/connector.md, "The tool list follows the session"). The hub is stateless and cannot send this itself.
+  let listed = null;
   const refresh = (stale) => {
     if (token !== stale) return Promise.resolve({ ok: true });
     relogin ??= getToken(true).finally(() => { relogin = null; });
@@ -131,6 +134,9 @@ export async function runMcp(folderArg, { home, input = process.stdin, output = 
         return rpcError(id, `the hub answered HTTP ${r.status}${[code, message].filter(Boolean).length ? `: ${[code, message].filter(Boolean).join(': ').slice(0, 500)}` : ''}`);
       }
       if (r.sessionId) sessionId = r.sessionId;
+      const listing = !Array.isArray(msg) && msg?.method === 'tools/list';
+      const changed = !listing && r.tools && listed && r.tools !== listed;
+      if (r.tools && (listing || changed)) listed = r.tools;
       for (const m of r.messages) {
         if (msg?.method === 'initialize' && m?.id === id && typeof m?.result?.protocolVersion === 'string') protocolVersion = m.result.protocolVersion;
         if (msg?.method === 'initialize') codexClient = /codex/i.test(String(msg?.params?.clientInfo?.name ?? ''));
@@ -142,6 +148,7 @@ export async function runMcp(folderArg, { home, input = process.stdin, output = 
         }
         write(m);
       }
+      if (changed) { logLine(`tools changed folder=${folder}`); write({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }); }
     } catch (e) {
       logLine(`fail ${e.reason ?? 'hub_unreachable'} folder=${folder}`);
       rpcError(id, reasonLine(e.reason ?? 'hub_unreachable'));

@@ -56,6 +56,16 @@ export async function lineFor(home, folder, { timeoutMs = HOOK_TIMEOUT_MS, repor
   return r.ok && typeof r.line === 'string' ? r.line : null;
 }
 
+/**
+ * What the unread line was last shown for, per hub and agent, in the connector's own process: shown again only when it differs. It compares the
+ * counts, each room's top_seq and the directive count, not the line's text: new messages from the same sender give the same text.
+ */
+const lastShown = new Map();
+/** The state the line stands for: totals, each room's top_seq (a new message raises it) and the directive count. */
+export const unreadState = (c) => JSON.stringify([c?.total ?? 0, c?.directives ?? 0, (Array.isArray(c?.rooms) ? c.rooms : []).map((r) => [String(r?.room_id), r?.top_seq ?? 0]).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)), (Array.isArray(c?.senders) ? c.senders : []).map((g) => [g?.from, g?.label ?? null, g?.count ?? 0])]);
+/** Forgets what was shown (tests, and a connector that restarts starts empty anyway). */
+export function forgetShown() { lastShown.clear(); }
+
 /** The same line, built in the connector's own process (the broker's side of `lineFor`): the only place this loads a key. */
 export async function lineForLocal(home, folder, { timeoutMs = HOOK_TIMEOUT_MS, report = true } = {}) {
   try {
@@ -64,7 +74,14 @@ export async function lineForLocal(home, folder, { timeoutMs = HOOK_TIMEOUT_MS, 
     const s = await signIn(home, ctx);
     if (!s.ok || !s.agentId) return null;
     const counts = await fetchCounts(ctx, s.agentId, timeoutMs);
-    const line = reminderLine(counts);
+    let line = reminderLine(counts);
+    // The unread line shows when what waits changes, not at every prompt: the same state again says nothing new (docs/connector.md).
+    if (report) {
+      const key = ctx.hubKey + '|' + s.agentId, state = unreadState(counts);
+      if (!line) lastShown.delete(key);
+      else if (lastShown.get(key) === state) line = null;
+      else lastShown.set(key, state);
+    }
     if (line && report && counts.total > 0) await reportShown(ctx, s.agentId, counts.rooms, timeoutMs);
     // Items the hub delivered to this PC for the agent (a delivery order, until the wake ships here): shown once, at the agent's next prompt.
     const items = report ? takeFor(home, ctx.hubKey, s.agentId) : (waiting(home, ctx.hubKey)[s.agentId] ?? []);

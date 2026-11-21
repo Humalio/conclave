@@ -94,6 +94,57 @@ describe('the key file is encrypted at rest', () => {
   });
 });
 
+describe('the platform stores keep the key file\'s secret, give it back, and fail with a fixed reason', () => {
+  const asPlatformStore = (fn) => {
+    const saved = { ...storeIo }, env = process.env.CONCLAVE_KEY_STORE, dbus = process.env.DBUS_SESSION_BUS_ADDRESS;
+    try { delete process.env.CONCLAVE_KEY_STORE; forgetMasters(); return fn(); }
+    finally { Object.assign(storeIo, saved); process.env.CONCLAVE_KEY_STORE = env; if (dbus === undefined) delete process.env.DBUS_SESSION_BUS_ADDRESS; else process.env.DBUS_SESSION_BUS_ADDRESS = dbus; forgetMasters(); }
+  };
+  test('DPAPI (real, on Windows): the secret is protected, not in keys.master, read back by a new process, and a damaged blob is keystore_unavailable', { skip: process.platform === 'win32' ? false : 'DPAPI exists on Windows only' }, () => asPlatformStore(() => {
+    const home = mk();
+    const k = withKeys(home);
+    assert.equal(storeName(home), 'dpapi');
+    const rec = JSON.parse(readFileSync(masterPath(home), 'utf8'));
+    assert.equal(rec.store, 'dpapi');
+    assert.equal(typeof rec.blob, 'string');
+    assert.ok(!('secret' in rec), 'the 32-byte secret itself is not on disk');
+    forgetMasters(); // a new process
+    assert.equal(readKeyFile(home).data.hubs[k].agents['dev-1'].session_key, SES);
+    // a later failure of the store: a fixed reason, and no secret in it
+    writeFileSync(masterPath(home), JSON.stringify({ ...rec, blob: 'AAAA' }) + '\n');
+    forgetMasters();
+    assert.deepEqual(readKeyFile(home), { ok: false, reason: 'keystore_unavailable' });
+  }));
+  test('the Linux secret service (a fake secret-tool): the secret goes in on stdin, keys.master holds only a reference, it reads back, and a failing store is keystore_unavailable', () => asPlatformStore(() => {
+    const vault = new Map(), calls = [];
+    process.env.DBUS_SESSION_BUS_ADDRESS = 'unix:path=/run/fake-bus';
+    storeIo.platform = 'linux';
+    let broken = false;
+    storeIo.exec = (cmd, args, o = {}) => {
+      calls.push({ cmd, args, input: o.input });
+      if (cmd !== 'secret-tool' || broken) return { status: 1, stdout: '', stderr: 'locked' };
+      if (args[0] === '--version') return { status: 0, stdout: 'secret-tool 0.21', stderr: '' };
+      const service = args[args.indexOf('service') + 1];
+      if (args[0] === 'store') { vault.set(service, o.input); return { status: 0, stdout: '', stderr: '' }; }
+      const v = vault.get(service);
+      return v ? { status: 0, stdout: v, stderr: '' } : { status: 1, stdout: '', stderr: '' };
+    };
+    const home = mk();
+    const k = withKeys(home);
+    assert.equal(storeName(home), 'secret_service');
+    const secret = [...vault.values()][0];
+    assert.match(secret, /^[0-9a-f]{64}$/);
+    assert.ok(!readFileSync(masterPath(home), 'utf8').includes(secret), 'the secret is not in keys.master');
+    assert.ok(calls.every((c) => !c.args.some((a) => a.includes(secret))), 'the secret was never a command argument');
+    forgetMasters();
+    assert.equal(readKeyFile(home).data.hubs[k].agents['dev-1'].session_key, SES);
+    broken = true; forgetMasters();
+    const r = readKeyFile(home);
+    assert.deepEqual(r, { ok: false, reason: 'keystore_unavailable' });
+    assert.ok(!JSON.stringify(r).includes(secret));
+  }));
+});
+
 describe('the leak guard reads a transcript at the end of a turn', () => {
   const write = (text) => { const p = join(mk(), 't.jsonl'); writeFileSync(p, text); return p; };
   test('a clean transcript passes; a key of the agent, or anything shaped like a key, is found; an unreadable file is not a pass', () => {

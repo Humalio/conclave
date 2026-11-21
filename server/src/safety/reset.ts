@@ -6,8 +6,8 @@
  * references: resetting PCs removes those PCs' app keys and their logins, not every key.
  * The plan reports exactly what will go, including rows pulled in from other parts.
  *
- * Never touched: permission templates, the audit trail (append-only by design; each reset is recorded in it), admin accounts
- * and sessions, schema migrations, team role defaults, knowledge-graph budgets, other system settings,
+ * Never touched: permission templates, the audit trail (append-only by design; each reset is recorded in it) and its horizon,
+ * the database-health run history (docs/operations.md), admin accounts and sessions, schema migrations, team role defaults, knowledge-graph budgets, other system settings,
  * and the vault files on disk. For a blank hub including the audit trail, stop it and delete its data folder.
  */
 import type { Db } from '../db/db.js';
@@ -18,14 +18,14 @@ export interface ResetPart { key: string; label: string; detail: string; seeds: 
 const ALL = (tables: string[]) => tables.map((table) => ({ table }));
 export const RESET_PARTS: ResetPart[] = [
   { key: 'activity', label: 'Activity logs', detail: 'Tool calls, file access log, sign-in events, alerts and rate-limit counters. The audit trail is kept.',
-    seeds: ALL(['authentication_events', 'tool_invocations', 'resource_access_events', 'security_alerts', 'usage_counters']) },
+    seeds: ALL(['authentication_events', 'tool_invocations', 'resource_access_events', 'security_alerts', 'usage_counters', 'db_health_counts']) },
   { key: 'conversations', label: 'Conversations', detail: 'Direct and group chats with their messages.',
     seeds: ALL(['rooms', 'room_memberships', 'messages', 'message_delivery_cursors', 'message_ack_snapshots']) },
   { key: 'teams', label: 'Teams and tasks', detail: 'Teams, members, roles, task boards, work queues, decisions, team rooms and project blueprints.',
     seeds: [...ALL(['teams', 'team_members', 'team_roles', 'tasks', 'task_events', 'work_items', 'decisions', 'projects', 'bp_items', 'bp_links', 'bp_revisions', 'bp_events', 'bp_proposals', 'bp_report_requests']), { table: 'rooms', where: "kind='team'" }] },
   { key: 'agents', label: 'Agents, keys and permissions', detail: 'Agents, session and app keys, logins, rules and versions, links, notices, access requests and temporary grants.',
     // Only key policies: their rules and versions follow through foreign keys. Permission templates are configuration and stay.
-    seeds: [...ALL(['agents', 'credentials', 'session_tokens', 'agent_links', 'agent_notices', 'access_requests', 'temporary_grants', 'directive_acks', 'directive_reports']), { table: 'permission_policies', where: "kind='credential'" }] },
+    seeds: [...ALL(['agents', 'credentials', 'key_tombstones', 'session_tokens', 'agent_links', 'agent_notices', 'access_requests', 'temporary_grants', 'directive_acks', 'directive_reports']), { table: 'permission_policies', where: "kind='credential'" }] },
   { key: 'devices', label: 'PCs and bridges', detail: 'Registered PCs, bridge pairings, setup codes and approved folders, with the app keys issued to them, and the machines offered for compute with their waiting lists, flags and measured use.',
     seeds: ALL(['machines', 'machine_folders', 'bridge_keys', 'setup_keys', 'hw_machines', 'hw_machine_teams', 'hw_queue', 'hw_flags', 'hw_holds', 'hw_samples', 'hw_hold_use', 'hw_use_days']) },
   { key: 'shares', label: 'Shares and transfers', detail: 'Shares with their versions, recipients and feedback, promotions, and file transfer channels.',
@@ -37,7 +37,7 @@ export const RESET_PARTS: ResetPart[] = [
   { key: 'lockdown', label: 'Lockdown switches', detail: 'Every active lockdown: paused writes, frozen vault, locked agents, PCs and teams.',
     seeds: [{ table: 'system_settings', where: "key LIKE 'emergency.%'" }] },
 ];
-const KEEP = new Set(['audit_events', 'admin_users', 'admin_sessions', 'schema_migrations', 'team_role_defaults', 'kg_budgets']);
+export const KEEP = new Set(['audit_events', 'audit_horizon', 'db_health_runs', 'admin_users', 'admin_sessions', 'schema_migrations', 'team_role_defaults', 'kg_budgets']);
 
 export interface ResetPlan {
   parts: string[];
@@ -50,7 +50,7 @@ export interface ResetPlan {
   total: number;
 }
 
-type Fk = { child: string; from: string[]; to: string[] };
+export type Fk = { child: string; from: string[]; to: string[] };
 
 export class Reset {
   private kgTables: string[];
@@ -88,13 +88,21 @@ export class Reset {
     return RESET_PARTS.map((p) => p.key).filter((k) => keys.includes(k));
   }
 
-  /** Mark the rows to delete in temp tables, then follow foreign keys from removed rows to their dependants. */
+  /** The foreign keys that point at a table: each child table with its columns (database-health rules guard on them). */
+  childrenOf(table: string): Fk[] { return this.children.get(table) ?? []; }
+
   private mark(parts: string[]): Map<string, number> {
+    return this.walk(RESET_PARTS.filter((p) => parts.includes(p.key)).flatMap((p) => this.seedsOf(p)));
+  }
+
+  /**
+   * Mark the seed rows in temp tables, then follow foreign keys from removed rows to their dependants. Read inside a
+   * transaction; `deleteMarked` then removes exactly what was counted. Also used by the database-health rules.
+   */
+  walk(seeds: { table: string; where?: string }[]): Map<string, number> {
     const marked = new Set<string>();
     const ensure = (t: string) => { if (!marked.has(t)) { this.db.exec(`CREATE TEMP TABLE IF NOT EXISTS "_rs_${t}"(rid INTEGER PRIMARY KEY); DELETE FROM "_rs_${t}";`); marked.add(t); } };
-    for (const part of RESET_PARTS.filter((p) => parts.includes(p.key))) {
-      for (const s of this.seedsOf(part)) { ensure(s.table); this.db.exec(`INSERT OR IGNORE INTO "_rs_${s.table}" SELECT rowid FROM "${s.table}"${s.where ? ` WHERE ${s.where}` : ''}`); }
-    }
+    for (const s of seeds) { ensure(s.table); this.db.exec(`INSERT OR IGNORE INTO "_rs_${s.table}" SELECT rowid FROM "${s.table}"${s.where ? ` WHERE ${s.where}` : ''}`); }
     for (let grew = true; grew;) {
       grew = false;
       for (const parent of [...marked]) {
@@ -139,6 +147,14 @@ export class Reset {
     };
   }
 
+  /** Delete the rows a walk marked; foreign keys are checked at the end, so the caller's transaction rolls back on a dangling one. */
+  deleteMarked(counts: Map<string, number>, what: string): void {
+    this.db.exec('PRAGMA defer_foreign_keys=ON');
+    for (const [t, n] of counts) if (n) this.db.exec(`DELETE FROM "${t}" WHERE rowid IN (SELECT rid FROM "_rs_${t}")`);
+    const broken = this.db.prepare('PRAGMA foreign_key_check').all();
+    if (broken.length) throw new Error(`${what} would leave ${broken.length} dangling references; nothing was changed`);
+  }
+
   /** What a reset of these parts would remove. Nothing changes. */
   plan(requested: string[]): ResetPlan {
     const parts = Reset.normalize(requested);
@@ -151,9 +167,7 @@ export class Reset {
     return tx(this.db, () => {
       this.db.exec('PRAGMA defer_foreign_keys=ON');
       const counts = this.mark(parts);
-      for (const [t, n] of counts) if (n) this.db.exec(`DELETE FROM "${t}" WHERE rowid IN (SELECT rid FROM "_rs_${t}")`);
-      const broken = this.db.prepare('PRAGMA foreign_key_check').all();
-      if (broken.length) throw new Error(`reset would leave ${broken.length} dangling references; nothing was changed`);
+      this.deleteMarked(counts, 'reset');
       return this.summarize(parts, counts);
     });
   }

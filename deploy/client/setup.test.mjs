@@ -104,3 +104,76 @@ test('key swaps a key prompt\'s pickup code for the key: keys.env gets the varia
     assert.ok(!existsSync(join(conf, 'onboarding', 'key-code')));
   } finally { srv.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+// docs/onboarding.md, "Collisions": before pickup, a variable already in keys.env that this setup did not write (unless
+// --replace), or a target folder whose .agent-hub.json names another variable, stops setup. Nothing is picked up, so no
+// issue is used. Against a stub hub on 127.0.0.1 (plain HTTP is accepted on loopback only), in temporary homes.
+test('a variable or folder collision stops `wait` before pickup; --replace lets a variable collision through', async () => {
+  const { createServer } = await import('node:http');
+  const { spawn } = await import('node:child_process');
+  const APP = `ah_app_${'c'.repeat(12)}_${'d'.repeat(32)}`, OLD = `ah_ses_${'o'.repeat(12)}_${'p'.repeat(32)}`, NEW = `ah_ses_${'n'.repeat(12)}_${'q'.repeat(32)}`;
+  const VAR = 'CONCLAVE_ATLAS_COORDINATOR_SESSION_KEY';
+  const agents = [{ agent_id: 'agt_c', label: 'Coordinator', role: 'coordinator', team_role: 'coordinator', session_var: VAR, folder: 'coordinator' }];
+  const seen = [];
+  const srv = createServer((req, res) => {
+    let raw = ''; req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const path = new URL(req.url, 'http://x').pathname;
+      seen.push(path);
+      const json = (s, j) => { res.writeHead(s, { 'content-type': 'application/json' }); res.end(JSON.stringify(j)); };
+      if (req.headers.authorization !== `Bearer ${APP}`) return json(401, { error: 'unauthorized' });
+      if (path === '/onboard/requests/obr_coll1') return json(200, { state: 'approved', version: 2, team_name: 'Atlas', project: 'Atlas', agents });
+      if (path === '/onboard/pickup') return json(200, { pickup_id: 'opk_1', team: { id: 'team_1', name: 'Atlas' }, agents: agents.map((a) => ({ ...a, secret: NEW, instructions: '# Coordinator\n' })) });
+      if (path === '/onboard/pickup/confirm') return json(200, { team_status: 'active', started: false });
+      json(404, { error: 'not_found' });
+    });
+  });
+  await new Promise((ok) => srv.listen(0, '127.0.0.1', ok));
+  const hub = `http://127.0.0.1:${srv.address().port}`;
+  const dirs = [];
+  /** A home enrolled with this hub and an approved request whose folders go under <home>/root. */
+  const world = (keysExtra = '') => {
+    const dir = mkdtempSync(join(tmpdir(), 'ahs-coll-')); dirs.push(dir);
+    const conf = join(dir, '.config', 'conclave'), root = join(dir, 'root');
+    mkdirSync(join(conf, 'onboarding'), { recursive: true });
+    writeFileSync(join(conf, 'keys.env'), `AGENT_HUB_APP_KEY=${APP}\nAGENT_HUB_URL=${hub}/mcp\n${keysExtra}`);
+    writeFileSync(join(conf, 'onboarding', 'state.json'), JSON.stringify({ version: '1', hub, transport: 'http', current: 'obr_coll1', requests: { obr_coll1: { id: 'obr_coll1', kind: 'new_team', state: 'submitted', root } } }));
+    return { dir, conf, root };
+  };
+  const run = (w, extra = []) => new Promise((ok) => {
+    const p = spawn(process.execPath, [fileURLToPath(new URL('./setup.mjs', import.meta.url)), 'wait', '--transport', 'http', '--max-minutes', '0', ...extra], { env: { ...process.env, HOME: w.dir, USERPROFILE: w.dir } });
+    let out = ''; p.stdout.on('data', (c) => { out += c; }); p.stderr.on('data', (c) => { out += c; });
+    p.on('close', (status) => ok({ status, out }));
+  });
+  const pickups = () => seen.filter((p) => p === '/onboard/pickup').length;
+  try {
+    // A variable this setup did not write.
+    const a = world(`${VAR}=${OLD}\n`);
+    const r1 = await run(a);
+    assert.equal(r1.status, 1, r1.out);
+    assert.match(r1.out, new RegExp(`fail collision: ${VAR} already exists in keys\\.env`));
+    assert.match(r1.out, /Nothing was picked up/);
+    assert.equal(pickups(), 0, 'no pickup, so no issue is used');
+    assert.ok(seen.includes('/onboard/requests/obr_coll1'), 'the hub was asked for the request');
+    assert.match(readFileSync(join(a.conf, 'keys.env'), 'utf8'), new RegExp(`^${VAR}=${OLD}$`, 'm'), 'the old key is untouched');
+    assert.ok(!r1.out.includes(OLD) && !r1.out.includes(APP));
+
+    // A target folder whose .agent-hub.json names another variable stops setup, also with --replace.
+    const b = world();
+    mkdirSync(join(b.root, 'Atlas', 'coordinator'), { recursive: true });
+    writeFileSync(join(b.root, 'Atlas', 'coordinator', '.agent-hub.json'), JSON.stringify({ session_var: 'SOMEONE_ELSES_SESSION_KEY' }));
+    const r2 = await run(b, ['--replace']);
+    assert.equal(r2.status, 1, r2.out);
+    assert.match(r2.out, /fail collision: .*coordinator belongs to SOMEONE_ELSES_SESSION_KEY/);
+    assert.equal(pickups(), 0);
+    assert.doesNotMatch(readFileSync(join(b.conf, 'keys.env'), 'utf8'), new RegExp(VAR));
+
+    // The same variable with --replace: setup goes on to the pickup and replaces it.
+    const r3 = await run(a, ['--replace']);
+    assert.doesNotMatch(r3.out, /fail collision/, r3.out);
+    assert.equal(pickups(), 1, 'the pickup happens');
+    assert.ok(seen.includes('/onboard/pickup/confirm'));
+    assert.match(readFileSync(join(a.conf, 'keys.env'), 'utf8'), new RegExp(`^${VAR}=${NEW}$`, 'm'));
+    assert.ok(!r3.out.includes(NEW) && !r3.out.includes(OLD));
+  } finally { srv.close(); for (const d of dirs) rmSync(d, { recursive: true, force: true }); }
+});

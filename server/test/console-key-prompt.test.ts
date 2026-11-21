@@ -119,13 +119,8 @@ describe('console: where the guard applies', () => {
     expect((await run('none', true)).ok).toBe(1);
   });
   it('no prompt or key screen offers a download', () => {
-    // Add PC's one exception: the link to the connector installer on GitHub Releases (docs/connector.md, "Add PC"). It
-    // carries no key: it is only the configured release URL, never a Blob or a data URL.
-    // The link and the installer's name live in jnInstallH, Add PC's first step; the sheet itself offers no download.
-    const inst = js.slice(js.indexOf('const jnInstallH = '), js.indexOf('const OB_NO_PROMPT'));
-    expect(fn('joinSheet')).toContain('${jnInstallH(made)}');
-    expect(inst).toContain('<a href="${esc(made.download_url)}" target="_blank" rel="noopener noreferrer">');
-    expect(inst).not.toMatch(/Blob\(|data:|createObjectURL|made\.code|made\.pairing|connector_prompt/);
+    // The installer link is gone from Add PC: the prompt tells the PC's coding agent where to download it from.
+    expect(js).not.toContain('jnInstallH');
     for (const f of ['secretView', 'obPromptSheet', 'joinSheet', 'keyPromptNote']) {
       expect(fn(f), f).not.toMatch(/download|Download|Blob\(/);
     }

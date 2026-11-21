@@ -29,7 +29,10 @@ export class Messaging {
   private _closed = false;
   /** Set by Teams: fed every stored message so team members get it as a work item. */
   onInsert: ((m: MessageRow) => void) | null = null;
-  /** Set in app.ts: a message an agent wrote, for the connector's delivery orders (they are L2: rate-limited there). */
+  /**
+   * Set in app.ts: a stored message and the members it wakes, for the connector's delivery orders (an agent's are L2:
+   * rate-limited there). See `wakes` for who that is.
+   */
   onSent: ((m: MessageRow, recipients: string[]) => void) | null = null;
   constructor(private readonly db: Db, private readonly keys: Keys, private readonly links: Links) { this.em.setMaxListeners(0); }
 
@@ -123,6 +126,26 @@ export class Messaging {
   findDuplicate(credId: string, clientMsgId: string): MessageRow | null {
     return (this.db.prepare('SELECT * FROM messages WHERE sender_credential_id=? AND client_msg_id=?').get(credId, clientMsgId) as unknown as MessageRow) ?? null;
   }
+  /**
+   * Who a stored message wakes through the connector (docs/connector.md, delivery orders). The operator's or the hub's message:
+   * every member. An agent's message: in a direct room the other member; in any other room only the members it addresses, by
+   * an @mention of their label (exact, any letter case, not inside a longer word or label) or by replying to their message.
+   * Never the sender. The others still get the message as unread at their next prompt.
+   */
+  wakes(m: MessageRow): string[] {
+    const members = this.members(m.room_id).map((x) => x.agent_id).filter((a) => a !== m.sender_agent_id);
+    if (m.sender_agent_id === null) return members;
+    if (this.room(m.room_id)?.kind === 'direct') return members;
+    const replied = m.reply_to ? this.message(m.reply_to)?.sender_agent_id ?? null : null;
+    const body = m.body.toLowerCase();
+    return members.filter((a) => {
+      if (a === replied) return true;
+      const label = this.keys.agent(a)?.label?.trim().toLowerCase();
+      if (!label) return false;
+      const esc = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp(String.raw`(^|[^\p{L}\p{N}_@-])@${esc}(?![\p{L}\p{N}_-])`, 'u').test(body);
+    });
+  }
   message(id: string): MessageRow | null { return (this.db.prepare('SELECT * FROM messages WHERE id=?').get(id) as unknown as MessageRow) ?? null; }
   /** Count one message against the key's hourly allowance. Returns seconds to wait when over the limit, else null. */
   rateCheck(credId: string, limit: number, now = Date.now()): number | null {
@@ -143,7 +166,7 @@ export class Messaging {
       return this.message(id)!;
     });
     this.onInsert?.(m);
-    try { this.onSent?.(m, this.members(m.room_id).map((x) => x.agent_id).filter((a) => a !== m.sender_agent_id)); } catch { /* delivery never blocks a message */ }
+    try { this.onSent?.(m, this.wakes(m)); } catch { /* delivery never blocks a message */ }
     this.em.emit(`message:${m.room_id}`);
     return m;
   }

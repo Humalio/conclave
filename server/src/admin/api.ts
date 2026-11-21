@@ -32,6 +32,7 @@ import { registerVaultApi } from './vaultApi.js';
 import { registerVaultLinksApi } from './vaultLinksApi.js';
 import { registerVaultWriteApi } from './vaultWrite.js';
 import { registerResetApi } from './resetApi.js';
+import { registerDbHealthApi } from './dbHealthApi.js';
 import { registerDemoApi } from './demoApi.js';
 import type { DemoController } from '../demo/demo.js';
 import { registerTelemetryApi } from './telemetryApi.js';
@@ -349,7 +350,7 @@ export function registerAdminApi(f: FastifyInstance, d: AdminDeps): string[] {
     // is set aside with Later (record: the row id, episode: its version) until `until`, or until it changes when `until`
     // is null or left out, and at most 7 days. The wrong kind for the row is refused. Bring back now ends a Later.
     api.post('/api/needs-you/dismiss', async (req) => {
-      const b = body(z.object({ record: z.string().min(1).max(300), episode: z.string().max(200), kind: z.enum(['dismiss', 'later']).optional(), until: z.number().int().positive().nullable().optional() }).strict(), req);
+      const b = body(z.object({ record: z.string().min(1).max(300), episode: z.string().max(2000), kind: z.enum(['dismiss', 'later']).optional(), until: z.number().int().positive().nullable().optional() }).strict(), req);
       if (b.kind !== 'later') {
         if (b.until !== undefined) throw new KeyError('invalid_argument', 'A dismissal has no end time; only Later does.');
         await needs(req).dismiss(viewer(req), b.record, b.episode);
@@ -652,6 +653,7 @@ export function registerAdminApi(f: FastifyInstance, d: AdminDeps): string[] {
     registerVaultLinksApi(api, { vault });
     registerVaultWriteApi(api, { db, audit, vault, store: d.store }, actor);
     registerResetApi(api, { db, audit, config, loginLimit, users, maintenance: d.phase5.maintenance }, actor);
+    if (d.phase5.maintenance.health) registerDbHealthApi(api, { db, audit, loginLimit, users, health: d.phase5.maintenance.health }, actor);
     if (config.demoMode && d.demo) registerDemoApi(api, { demo: d.demo, audit }, actor);
     registerTelemetryApi(api, { db, audit }, actor);
     registerFeedbackApi(api, { feedback: d.feedback }, actor);
@@ -662,7 +664,7 @@ export function registerAdminApi(f: FastifyInstance, d: AdminDeps): string[] {
     if (d.checkouts && d.checkoutKeys) registerCheckoutApi(api, { checkouts: d.checkouts, checkoutKeys: d.checkoutKeys, delegations: d.delegations, teams: d.teams, label: (a) => keys.agent(a)?.label ?? a,
       restoreNow: d.connector ? (id, who) => d.connector!.restoreIfOneDestination(id, who) : undefined }, actor);
     if (d.mirror) registerMirrorApi(api, d.mirror, actor);
-    registerDecisionsApi(api, { db, decisions: d.decisions, teams: d.teams, vault, routing: d.routing }, actor);
+    registerDecisionsApi(api, { db, decisions: d.decisions, teams: d.teams, vault, routing: d.routing, blueprint: d.blueprint, keys, attachments: d.taskAttachments, store: d.store }, actor);
     const bpSources = new Sources(db, vault);
     registerBlueprintApi(api, { db, blueprint: d.blueprint, teams: d.teams, routing: d.routing, bpRouting, sources: bpSources, meetings: new Meetings(db, vault, bpSources) }, actor);
 

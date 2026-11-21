@@ -60,6 +60,21 @@ describe('the leftovers flag', () => {
     expect((await cn(pc.key, { ...base0, legacy_leftovers: ['keys.env'] })).status).toBe(400);
     expect((await pcOf(pc.id)).connector.legacy_leftovers).toBeNull();
   });
+  it('says which kinds are left, as fixed words, and reads Unknown until reported', async () => {
+    const pc = await newPc('kinds');
+    expect((await pcOf(pc.id)).connector.legacy_leftover_kinds).toBeNull();
+    expect((await cn(pc.key, { ...base0, legacy_leftovers: true, legacy_leftover_kinds: ['unfinished_move', 'old_keys'] })).status).toBe(200);
+    expect((await pcOf(pc.id)).connector.legacy_leftover_kinds).toEqual(['unfinished_move', 'old_keys']);
+    expect((await cn(pc.key, { ...base0, legacy_leftovers: false, legacy_leftover_kinds: [] })).status).toBe(200);
+    expect((await pcOf(pc.id)).connector.legacy_leftover_kinds).toEqual([]);
+  });
+  it('takes only the fixed kinds: a path, a name or an unknown word is refused', async () => {
+    const pc = await newPc('kinds-refused');
+    for (const bad of [['C:/Users/x/keys.env'], ['keys.env'], ['made_up'], 'old_keys', ['old_keys', 'old_keys', 'ca_setting', 'bridge_pieces', 'unfinished_move']]) {
+      expect((await cn(pc.key, { ...base0, legacy_leftover_kinds: bad })).status).toBe(400);
+    }
+    expect((await pcOf(pc.id)).connector.legacy_leftover_kinds).toBeNull();
+  });
   it('lists the PCs that still have leftovers and no other', async () => {
     const a = await newPc('left-a'), b = await newPc('clean-b');
     await cn(a.key, { ...base0, legacy_leftovers: true });
@@ -76,9 +91,14 @@ describe('the console', () => {
     expect(js).toContain("['old', 'Old setup left', (p) => p.connector?.legacy_leftovers === true]");
     expect(js).toContain("p.connector?.legacy_leftovers === true ? pill('Old setup left', 'warn')");
   });
+  it('names the kinds next to the flag, and shows no bridge version for a PC that has a connector', () => {
+    expect(js).toContain("leftoverText(cn.legacy_leftover_kinds)");
+    expect(js).toContain("unfinished_move: 'an unfinished move to the connector (rollback copies)'");
+    expect(js).toContain("(cn.status !== 'never' ? null : 'bridge ' + br.version)");
+  });
   it('says on the PC page what clears the leftovers, and reads Unknown until reported', () => {
     expect(js).toContain("kv('Old setup', cn.legacy_leftovers === true");
-    expect(js).toContain('conclave migrate --finish --remove-legacy-ca');
+    expect(js).toContain('<span class="mono">conclave check</span> says what is left and how to clear it');
     expect(js).toContain("cn.legacy_leftovers === false ? 'Cleared' : CN_UNK");
   });
 });

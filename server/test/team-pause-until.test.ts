@@ -98,10 +98,30 @@ describe('a pause with an end time', () => {
     expect(k).toMatchObject({ status: 'in_progress', assignee_agent_id: X.w.id });
     expect(k.lease_expires_at!).toBeGreaterThanOrEqual(before + tm.lease_minutes * 60_000 - 1000);
     expect(notices(X.w.id, 'lease_expired')).toHaveLength(0);
-    expect(notices(X.w.id, 'team_resumed')).toHaveLength(1);
+    expect(notices(X.w.id, 'team_resumed')).toHaveLength(1); // it has a task in progress: woken
+    expect(notices(X.w.id, 'team_resumed_note')).toHaveLength(0);
+    expect(notices(X.c.id, 'team_resumed')).toHaveLength(1); // the coordinator has no task of its own: woken all the same
+    expect(notices(X.c.id, 'team_resumed_note')).toHaveLength(0);
     // Audited with the system as the actor.
     const ev = app.db.prepare("SELECT actor_kind FROM audit_events WHERE action='team.resume' AND target_id=?").all(X.tid) as { actor_kind: string }[];
     expect(ev).toEqual([{ actor_kind: 'system' }]);
+  });
+
+  it('a coordinator is always woken on resume, whatever the tasks; another member without a task is only told', async () => {
+    const X = await team();
+    const t = (await X.C('task_create', { team_id: X.tid, title: 'unassigned' })).structuredContent.task; // open, nobody holds it
+    app.teams.pause(X.tid, 'coordinator', sys);
+    app.teams.resume(X.tid, sys);
+    expect(notices(X.c.id, 'team_resumed')).toHaveLength(1);
+    expect(notices(X.w.id, 'team_resumed_note')).toHaveLength(1); // another member without a task is still only told
+    expect(notices(X.w.id, 'team_resumed')).toHaveLength(0);
+    // Every task closed: the coordinator is woken all the same, the worker still only told.
+    app.db.prepare("UPDATE tasks SET status='cancelled' WHERE id=?").run(t.id);
+    app.teams.pause(X.tid, 'coordinator', sys);
+    app.teams.resume(X.tid, sys);
+    expect(notices(X.c.id, 'team_resumed')).toHaveLength(2);
+    expect(notices(X.c.id, 'team_resumed_note')).toHaveLength(0);
+    expect(notices(X.w.id, 'team_resumed_note')).toHaveLength(2);
   });
 
   it('a coordinator sets at most 24 hours ahead, in the future, and only a coordinator may', async () => {
@@ -122,7 +142,9 @@ describe('a pause with an end time', () => {
     await X.C('team_pause', { team_id: X.tid, reason: 'usage limit', until: Date.now() + HOUR });
     expect((await X.W('team_resume', { team_id: X.tid })).structuredContent.error).toBe('denied');
     expect((await X.C('team_resume', { team_id: X.tid })).structuredContent).toMatchObject({ status: 'running' });
-    expect(notices(X.w.id, 'team_resumed')).toHaveLength(1);
+    // No member has a task: nobody is woken, everyone is told.
+    expect(notices(X.w.id, 'team_resumed')).toHaveLength(0);
+    expect(notices(X.w.id, 'team_resumed_note')).toHaveLength(1);
 
     expect((await api('POST', `/teams/${X.tid}/pause`)).status).toBe(200);
     let r = await X.C('team_resume', { team_id: X.tid });

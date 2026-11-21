@@ -165,6 +165,12 @@ These requirements define the intended platform behavior. Use the stable require
 
 - <a id="spec-fdbk-01"></a>**SPEC-FDBK-01 · Reports and the tasks that fix them.** A report can be linked to the tasks that fix it. When every linked task is approved and done, the report is marked fixed for the next hub version, and the operator can still reopen or correct it.
 
+## Audit trail and database health
+
+The audit trail is append-only. No audit row can be changed, and no row younger than the audit horizon can be deleted; the database enforces both. Only the operator can move the horizon, through the **Audit trail** clean-up rule (off by default), and only forward and never to less than 365 days ago. Before any row leaves the hub, the rule archives it to a compressed file beside the backups, with a hash chain that proves the file whole and in order. It also records one `audit.trimmed` event naming the file, its sha256 and the date range, and that event is never removed. The last 365 days of security history therefore always stay in the hub.
+
+The other clean-up rules (activity, revoked keys, finished items, stale PCs and agents, and the by-hand revoke of long-suspended keys), the backups, integrity checks and compaction are in **Security → Database**; see [operations](operations.md). Every run takes a backup first, removes exactly what its preview listed, and is audited. A revoked key leaves a tombstone, so its reuse still raises the reused-key alert. An agent with any record it wrote is never removed.
+
 ## Where each area is
 
 The Blueprint groups the requirements by module. Each module links to the guide that describes how it works today.
@@ -184,6 +190,6 @@ The Blueprint groups the requirements by module. Each module links to the guide 
 | Console access | Project and component grants, external accounts, delegation | [multi-user console](multi-user.md) |
 | Team decisions | Questions, routed answers, and task blocks | [decisions](decisions.md) |
 | Checkout | Checkpoint, handout, and restore a team | [checkout](checkout.md) |
-| `OPS` | Safety, audit and operations (the NFRs) | [threat model](threat-model.md), [deployment](getting-started.md#container-deployment) |
+| `OPS` | Safety, audit and operations (the NFRs) | [threat model](threat-model.md), [operations](operations.md), [deployment](getting-started.md#container-deployment) |
 
 Release and regression checks that need a real environment stay in the [acceptance checklist](acceptance.md). See [dashboard UX](dashboard-ux.md) for the console.

@@ -28,12 +28,13 @@ export const REASONS = {
   old_layout: { why: 'This folder still uses the old Conclave setup (the headers helper or the Codex bridge); `conclave migrate` moves it to the connector.', run: 'conclave migrate' },
   folder_changed: { why: 'This folder gained or changed agent settings since it was registered.', run: 'conclave repair' },
   role_file_missing: { why: "This Codex folder's role file (AGENTS.override.md) is missing, so the agent does not get the hub's playbook.", run: 'conclave repair' },
+  codex_tools_broken: { why: "Codex on this PC cannot run any tool: its code-mode host program is missing, so every tool call fails. Reinstall Codex, then check again.", run: "conclave check" },
   role_file_edited: { why: "This Codex folder's role file (AGENTS.override.md) was changed since the connector wrote it.", run: 'conclave repair' },
   role_file_unmarked: { why: "This Codex folder's AGENTS.override.md was not written by the connector, so the agent reads it instead of the hub's playbook. Move it away first (for an old one from codex.mjs, run conclave migrate).", run: 'conclave repair' },
 };
 
 /** The order in which `conclave check` looks, so it always names one reason. */
-export const ORDER = ['old_layout', 'keyfile_unreadable', 'keystore_unavailable', 'vault_unavailable', 'keyfile_unsafe', 'not_registered', 'identity_changed', 'no_hub_key', 'ca_bundle', 'ca_changed', 'key_missing', 'not_https', 'entry_stale', 'trust_withdrawn', 'folder_changed', 'role_file_unmarked', 'role_file_missing', 'role_file_edited', 'tls_refused', 'hub_unreachable', 'login_refused'];
+export const ORDER = ['old_layout', 'keyfile_unreadable', 'keystore_unavailable', 'vault_unavailable', 'keyfile_unsafe', 'not_registered', 'identity_changed', 'no_hub_key', 'ca_bundle', 'ca_changed', 'key_missing', 'not_https', 'entry_stale', 'trust_withdrawn', 'folder_changed', 'role_file_unmarked', 'role_file_missing', 'role_file_edited', 'codex_tools_broken', 'tls_refused', 'hub_unreachable', 'login_refused'];
 
 /** "Why. Run: what" for a reason code, in the fixed words. The commands act on the working folder, so no path is named. */
 export function line(code) {

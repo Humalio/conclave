@@ -24,13 +24,12 @@ http://:{$HTTP_PORT} {
 	handle @machine {
 		reverse_proxy agent-hub:8080
 	}
-	# Onboarding downloads (docs/onboarding.md): a new PC fetches them before it trusts the internal CA,
-	# so they must work over plain HTTP. That is safe because each is public and checked against a hash
-	# the operator copied from the console over HTTPS: setup.mjs and agent-hub-headers.mjs against the
-	# SHA-256 in the prompt, ca.crt against the fingerprint in the prompt. A changed byte stops setup.
-	# Only these paths: enrolment, requests and pickup carry codes and keys, so they keep the redirect
-	# below (and the hub answers 426 on plain HTTP); the script reaches them over HTTPS with the CA pinned.
-	@onboard_files path /onboard/client/* /onboard/ca.crt
+	# The CA certificate (docs/onboarding.md): a new PC may fetch it before it trusts the internal CA,
+	# so it works over plain HTTP. That is safe because it is public and checked against the fingerprint
+	# in the prompt. A PC installs the connector from its release, so no other onboarding file is served
+	# here. Pairing, requests and pickup carry codes and keys, so they keep the redirect below (and the
+	# hub answers 426 on plain HTTP); the connector reaches them over HTTPS with the CA pinned.
+	@onboard_files path /onboard/ca.crt
 	handle @onboard_files {
 		reverse_proxy agent-hub:8080
 	}

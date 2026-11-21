@@ -80,7 +80,7 @@ All three are default tools: agents have them without a grant. `directives_repor
 
 ### Agents report their rules
 
-The `CLAUDE.md` that onboarding writes into each agent's folder (`CLAUDE.local.md` after a checkout, `AGENTS.override.md` for a Codex agent) has a **Directives** section, after the playbook. All three are built from the same hub text, and a test keeps the Codex file's sections equal to the Claude Code ones. The start line that `setup.mjs` prints for each agent, Claude Code or Codex, begins with `directives_read {unread: true, ack: true}`. The section points to the directives and does not repeat them: the hub's list is the one to follow, so a change reaches the agent without a new file.
+The `CLAUDE.md` that onboarding writes into each agent's folder (`CLAUDE.local.md` after a checkout, `AGENTS.override.md` for a Codex agent) has a **Directives** section, after the playbook. All three are built from the same hub text, and a test keeps the Codex file's sections equal to the Claude Code ones. The start message in the terminal and Codex commands that the connector shows for each agent tells it to call `directives_read {unread: true, ack: true}` first. The section points to the directives and does not repeat them: the hub's list is the one to follow, so a change reaches the agent without a new file.
 - at first start, call `directives_read {unread: true, ack: true}`, and do the same when a notice says a directive changed;
 - suggest each rule followed from a file, a prompt or the chat with `directives_report`, once per rule, with its source;
 - "Don't report rules that are already in this file (playbook, goal, job, connection); report only rules from other files, prompts or chat." Those already reach the agent from the hub.
@@ -137,6 +137,7 @@ Cancelling an approved request before pickup stops the draft team; its directive
 - the text, scope, version, category, tags and source (a category or tag opens the list filtered by it);
 - each agent it reaches, with "Read", "Out of date" (read an older version) or "Not read";
 - its history.
+- **Minor edit, don't ask agents to re-read** on the edit sheet (`minor: true` on `PATCH /api/directives/:id`): for a typo. It still makes a new version and is audited, but no agent is told, and an agent that had read the previous version counts as having read this one. A change of scope is never minor.
 
 Edit creates a new version, and covered agents are told. Retire tells them to stop.
 

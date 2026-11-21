@@ -19,13 +19,17 @@ import { connect, request, reasonOfError } from './hubclient.mjs';
 import { readKeyFile, putHub, normalizeOrigin, caFingerprint, pemBlocks, singleCaPem, hubKeyOf, HUB_ID_RE } from './keyfile.mjs';
 import { CONNECTOR_VERSION } from './version.mjs';
 
-export const CODE_RE = /^cnv_enrol_[a-z2-7]{26}$/;
+// `cnc-pair-` is the code the hub makes now; `cnv_enrol_` is the older form, still accepted from a hub that has not changed yet.
+export const CODE_RE = /^(?:cnc-pair-|cnv_enrol_)[a-z2-7]{26}$/;
+
+/** What a one-prompt install tells the operator when the hub refuses a code (docs/onboarding.md, "The prompt"): the same words as the hub's prompt. */
+export const REFUSED_CODE_LINE = 'This code was refused. If you just received it, tell the operator now: someone else may have used it.';
 
 /** What the screen says for each outcome. One sentence each, never the hub's or the library's own text. */
 export const PAIR_LINES = {
   not_https: 'The hub address must start with https://.',
   bad_check: 'The hub check is the 16 letters and digits the console shows next to the code (for example ab12 cd34 ef56 7890).',
-  bad_code: 'The pairing code starts with cnv_enrol_. Copy it again from the console.',
+  bad_code: 'The pairing code starts with cnc-pair-. Copy it again from the console.',
   ca_mismatch: 'This is not the hub you were given: its certificate does not match. Nothing was sent.',
   no_ca: 'The hub does not serve its certificate (/onboard/ca.crt), so it cannot be checked. Nothing was sent.',
   ca_bundle: 'The hub serves more than one certificate where it should serve exactly one, so it cannot be pinned. Nothing was sent.',
@@ -34,7 +38,7 @@ export const PAIR_LINES = {
   origin_mismatch: 'The hub answers for another address than the one entered. Nothing was sent.',
   ca_changed: 'This hub is already set up on this PC with another certificate. Pair again only if your administrator told you its certificate changed.',
   origin_changed: 'This hub is already set up on this PC at another address. Pair again only if your administrator told you the address changed.',
-  code_refused: 'This pairing code is not valid, has expired or was already used. Make a new code in the console.',
+  code_refused: `This pairing code is not valid, has expired or was already used. Make a new code in the console. ${REFUSED_CODE_LINE}`,
   rate_limited: 'Too many failed attempts from this PC. Wait a while, then try again.',
   paired: 'Paired with the hub.',
 };
@@ -111,7 +115,10 @@ export async function pair(home, { origin, check, code }, opts = {}) {
   if (r.status === 429) return { ok: false, reason: 'rate_limited' };
   if (r.status !== 200 || typeof r.json?.app_key !== 'string' || r.json.hub?.id !== h.hub.id) return { ok: false, reason: 'code_refused' };
   const hubKey = putHub(home, { hubId: h.hub.id, origin: h.hub.origin, caPem: h.caPem, appKey: r.json.app_key });
-  return { ok: true, hubKey, hub: h.hub, pc: { id: String(r.json.pc?.id ?? ''), name: String(r.json.pc?.name ?? '') } };
+  // What the code was for: an operator's Add PC code (`pc`), or a collaborator's invite (`invite`, with the hub's words for it). A hub that says nothing is `pc`.
+  const kind = r.json.code_kind === 'invite' ? 'invite' : 'pc';
+  const inv = kind === 'invite' && r.json.invite && typeof r.json.invite === 'object' ? r.json.invite : null;
+  return { ok: true, hubKey, hub: h.hub, pc: { id: String(r.json.pc?.id ?? ''), name: String(r.json.pc?.name ?? '') }, kind, invite: inv };
 }
 
 export { hubKeyOf };

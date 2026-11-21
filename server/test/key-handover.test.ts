@@ -459,6 +459,7 @@ describe('a recruit reaches the connector PC by key handover', () => {
     expect(app.onboarding.request(r.pickup.request_id)).toMatchObject({ handover: 'recruit', kind: 'add_agents', state: 'approved' });
     const h = (await call('GET', '/connector/v1/handovers', pc.key)).body.handovers.find((x: any) => x.id === r.pickup.request_id);
     expect(h).toMatchObject({ kind: 'recruit', agents: [{ agent_id: r.agent_id, label: 'Second reader', key_id: null }] });
+    expect(h.no_click).toBe(true); // the team is set to Automatic: the connector needs no click on the PC
     expect(h.description).toContain(`1 new agent for team Recruiters ${n}`);
     // A crash after the keys were written but before confirm: the connector picks up again; still one agent, one live key.
     const agentsBefore = (app.db.prepare('SELECT COUNT(*) n FROM agents').get() as { n: number }).n;
@@ -475,6 +476,24 @@ describe('a recruit reaches the connector PC by key handover', () => {
     expect(await canLogin(p2.body.agents[0].secret)).toBe(true);
     expect(actions('key.handover.').filter((a) => JSON.parse(a.details).kind === 'recruit').map((a) => a.action)).toEqual(['key.handover.created', 'key.handover.picked_up', 'key.handover.picked_up', 'key.handover.confirmed']);
     expect(records()).not.toContain(p2.body.agents[0].secret);
+  });
+
+  it('a recruit of an ask-first team never carries no_click: the PC user still clicks', async () => {
+    const coord = app.keys.createAgent(`Coord ${++n}`, null, sys);
+    const ck = app.keys.createSessionKey({ agentId: coord.id, label: 'c', machineId: pc.id }, sys);
+    app.keys.setRules(ck.credential.policy_id, [{ effect: 'allow', actions: ['tool.invoke'], resource: 'tool:file_*' }, { effect: 'allow', actions: ['fs.list', 'fs.read', 'fs.update'], resource: 'path:/vault/Notes/**' }], 'test', sys);
+    const t = await api('POST', '/teams', { name: `Askers ${n}`, goal: 'g', members: [{ agent_id: coord.id, role: 'coordinator' }] });
+    const tid = t.body.team.id as string;
+    await api('POST', `/teams/${tid}/start`);
+    expect((await api('PATCH', `/teams/${tid}`, { recruiting: 'propose', recruit_max: 2, recruit_days: 5 })).status).toBe(200);
+    const C = (await mcp(pc.key, { secret: ck.secret }))!;
+    const q = (await C('team_recruit', { team_id: tid, label: 'Asked reader', role: 'reviewer', purpose: 'Check the notes' })).structuredContent;
+    expect(q.status).toBe('pending');
+    const ap = await api('POST', `/recruits/${q.request_id}/approve`);
+    expect(ap.status, JSON.stringify(ap.body)).toBe(200);
+    const h = (await call('GET', '/connector/v1/handovers', pc.key)).body.handovers.find((x: any) => x.id === ap.body.pickup.request_id);
+    expect(h, JSON.stringify(ap.body)).toMatchObject({ kind: 'recruit' });
+    expect(h.no_click).toBeUndefined();
   });
 
   it('a recruit not picked up within 24 hours is cancelled and its waiting agent archived', async () => {

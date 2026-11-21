@@ -61,7 +61,7 @@ describe('3. Needs you folds identical items', () => {
   const conflict = (n: number) => ({ id: 'conflict:fc_' + n, kind: 'vault_conflict', source: { kind: 'file_conflict', id: 'fc_' + n, version: 'open' }, scope: { project_id: null, team_id: null },
     title: `Vault conflict · Stress/c1/append-${n}.md · Choose`, reason: '', open: { kind: 'file_conflict', id: 'fc_' + n }, actions: [], at: now - n * 60_000 });
   const ROW = [part('function mdText(', '\n'), ...['ic', 'esc', 'ago', 'plural', 'trunc', 'raw', 'txt', 'safeHref', 'cap', 'none', 'pill'].map(line), part('const overline = ', '\n'), part('const NY_KIND = ', '};\n'),
-    line('nyKind'), fn('function nyOpenAttr('), line('nyLaterBtn'), fn('function nyBtns('), fn('function awBtns('), line('nyUntil'), line('nyOffline'), line('nySum'), line('nyMeta'), line('nyLead'), line('nyRow'), line('awRow'), fn('function row('),
+    line('nyKind'), fn('function nyOpenAttr('), line('nyActAttrs'), line('nyLaterBtn'), fn('function nyBtns('), fn('function awBtns('), line('nyUntil'), line('nyOffline'), line('nySum'), line('nyMeta'), line('nyLead'), line('nyRow'), line('awRow'), fn('function row('),
     line('NY_EFFECT_MAX'), part('const nyWho = ', '; };\n'), line('nyTeamOf'), line('nyHeadLine'), line('nyHead'), fn('function nyOpsLine('), line('nyReplyBtn'), line('nyReplyBox'), line('nyOpenBtn'), line('nyActBtn'), fn('function nyBody('), line('NY_QDET'), fn('function nyQCard('),
     part('const nyCardBox = ', '</article>`;\n'), fn('function nyCard('), fn('function nyCards('), part('const nyConflictCard = ', "Open conflicts</button>']);\n")];
   const cards = (rows: unknown[]) => {

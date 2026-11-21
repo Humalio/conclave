@@ -21,7 +21,7 @@ const nyItem = (id: string, title: string, mins: number) => ({ id, kind: 'access
   title, reason: 'Inside your ceiling', open: { kind: 'request', id: 'req_' + id }, actions: [{ id: 'approve', label: 'Approve', tone: 'ok' }, { id: 'deny', label: 'Deny' }], at: now - mins * 60_000 });
 
 const ROW = [part('function mdText(', '\n'), ...['ic', 'esc', 'ago', 'plural', 'trunc', 'raw', 'txt', 'safeHref', 'cap', 'none', 'pill'].map(line), part('const overline = ', '\n'), part('const NY_KIND = ', '};\n'),
-  line('nyKind'), fn('function nyOpenAttr('), line('nyLaterBtn'), fn('function nyBtns('), fn('function awBtns('), line('nyUntil'), line('nyOffline'), line('nySum'), line('nyMeta'), line('nyLead'), line('nyRow'), line('awRow'), fn('function row('),
+  line('nyKind'), fn('function nyOpenAttr('), line('nyActAttrs'), line('nyLaterBtn'), fn('function nyBtns('), fn('function awBtns('), line('nyUntil'), line('nyOffline'), line('nySum'), line('nyMeta'), line('nyLead'), line('nyRow'), line('awRow'), fn('function row('),
   line('NY_EFFECT_MAX'), part('const nyWho = ', '; };\n'), line('nyTeamOf'), line('nyHeadLine'), line('nyHead'), fn('function nyOpsLine('), line('nyReplyBtn'), line('nyReplyBox'), line('nyOpenBtn'), line('nyActBtn'), fn('function nyBody('), line('NY_QDET'), fn('function nyQCard('),
   part('const nyCardBox = ', '</article>`;\n'), fn('function nyCard('), fn('function awCard('), fn('function nyBacklogCard(')];
 const ctx0 = (S: unknown) => ({ S, Date, mdPlain, mdDoc: (t: string) => `<p>${t}</p>`, NAV_NAMES: new Map([['prj_c', 'Conclave']]), BP_KIND: { fr: 'Requirement', decision: 'Decision', release_note: 'Release note' }, dt: () => '14 Nov, 10:00',

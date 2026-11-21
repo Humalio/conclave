@@ -31,7 +31,9 @@ import { NFR_CATEGORIES, REQ_AC_MAX, REQ_ACS_MAX, REQ_TEXT_MAX, REQ_TITLE_MAX, S
 const HOUR = 3600_000, DAY = 24 * HOUR;
 export const MAX_WAIT_S = 45;
 export const MAX_REQUEST_BYTES = 32 * 1024;
-const CODE_RE = /^cnv_enrol_[a-z2-7]{26}$/;
+/** A pairing code: a fixed prefix the leak guard knows (docs/onboarding.md#the-code), then 26 base32 characters. */
+export const CODE_PREFIX = 'cnc-pair-';
+const CODE_RE = /^cnc-pair-[a-z2-7]{26}$/;
 const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
 const ROLE_RE = /^[a-z][a-z0-9_]{0,29}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]*$/;
@@ -118,6 +120,16 @@ export class OnboardError extends KeyError {
   constructor(code: string, message: string, public readonly extra: Record<string, unknown> = {}) { super(code, message); }
 }
 const fail = (code: string, msg: string, extra?: Record<string, unknown>) => new OnboardError(code, msg, extra);
+/** A connector's reported version or platform, as plain text of bounded length, or null. */
+const VERSION_TEXT = 40;
+const short = (v: unknown, max: number): string | null => typeof v === 'string' && /^[\w.+-]{1,80}$/.test(v) ? v.slice(0, max) : null;
+const actorId = (a: Actor): string => `${a.kind}:${a.id ?? ''}`;
+/** A redeemed pairing code, as "Paired just now" shows it (migration 0170). */
+/** A collaborator invite (migration 0171). */
+export interface InviteRow { id: string; team_id: string; role: string; team_role: string; owner_user_id: string; folders: string; template_id: string | null; bound: number; relay_id: string | null; created_by: string | null; created_at: number; expires_at: number; status: 'open' | 'redeemed' | 'revoked' | 'expired'; machine_id: string | null; code_opened_at: number | null; request_id: string | null; agent_id: string | null; redeemed_at: number | null; ended_at: number | null; ended_by: string | null }
+export interface InviteView { id: string; team: { id: string; name: string }; project: string | null; role: string; team_role: TeamRole; owner: { id: string; name: string }; folders: FolderIn[]; template_id: string | null; bound: boolean; relay_id: string | null;
+  status: InviteRow['status']; created_at: number; expires_at: number; pc: { id: string; name: string } | null; code_opened_at: number | null; paired: boolean; request_id: string | null; agent_id: string | null; redeemed_at: number | null }
+export interface PairingRow { id: string; machine_id: string; pc_name: string | null; app_credential_id: string; paired_at: number; source: string | null; version: string | null; platform: string | null; status: 'new' | 'kept' | 'revoked' }
 const parse = <T>(s: string | null, d: T): T => { if (s === null) return d; try { return JSON.parse(s) as T; } catch { return d; } };
 const up = (s: string) => s.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
@@ -202,6 +214,8 @@ export class Onboarding {
     this.em.setMaxListeners(0);
     // Recruiting delivers keys through this pickup (docs/onboarding.md#recruits-from-a-coordinator).
     d.teams.recruitPickup = (o, actor) => this.recruitFile(o, actor);
+    // A recruit template of an owned coordinator stays within the owner's folders, as an invite's do.
+    d.teams.ownerFolderProblems = (owner, folders) => this.ownerFolders(owner, folders).problems;
     d.teams.onRecruitsRetired = (teamId, actor) => this.cancelRecruits(teamId, actor);
     // A recruit's handover that expires or is cancelled ends the onboarding way: its waiting agent is archived.
     if (d.handovers) d.handovers.cancelRecruit = (id, note, actor) => { this.cancel(id, note, actor, true); };
@@ -235,7 +249,7 @@ export class Onboarding {
 
   // ───────────── Add PC, enrolment codes, Re-enrol ─────────────
   private newCode(machineId: string, appCredentialId: string): string {
-    const code = `cnv_enrol_${randomToken(17).slice(0, 26)}`; // 26 base32 characters, 130 random bits
+    const code = `${CODE_PREFIX}${randomToken(17).slice(0, 26)}`; // 26 base32 characters, 130 random bits
     this.db.prepare("INSERT INTO enrolment_codes(id,machine_id,app_credential_id,verifier,status,created_at,expires_at) VALUES (?,?,?,?,'unused',?,?)")
       .run(`enr_${randomToken(8)}`, machineId, appCredentialId, hmacHex(this.d.pepper, code), this.now(), null);
     return code;
@@ -268,6 +282,311 @@ export class Onboarding {
     this.audit.event(actor, 'onboarding.code_revoke', { kind: 'pc', id: machineId }, { codes: n });
     return { revoked: n };
   }
+  /**
+   * Show the prompt again (docs/onboarding.md#the-prompt): a new code for the PC's onboarding key, and the old unused code is
+   * void. Only before the PC has paired: after that, Re-enrol PC makes a new key and code.
+   */
+  renewCode(machineId: string, actor: Actor): { pc: Machine; code: string } {
+    const pc = this.keys.machine(machineId); if (!pc) throw fail('not_found', 'PC not found');
+    if (pc.status === 'retired') throw fail('invalid_state', 'A retired PC has no prompt.');
+    const last = this.db.prepare('SELECT app_credential_id, status FROM enrolment_codes WHERE machine_id=? AND expires_at IS NULL ORDER BY created_at DESC LIMIT 1').get(machineId) as { app_credential_id: string; status: string } | undefined;
+    const key = last ? this.keys.credential(last.app_credential_id) : null;
+    if (!last || last.status === 'confirmed' || last.status === 'issued' || !key || key.status !== 'active') throw fail('invalid_state', 'This PC has paired already, or has no onboarding key. Use Re-enrol PC for a new key and code.');
+    return tx(this.db, () => {
+      const voided = this.revokeCodes(machineId, ['unused']);
+      const code = this.newCode(pc.id, key.id);
+      this.audit.event(actor, 'onboarding.code_renew', { kind: 'pc', id: pc.id }, { codes_revoked: voided, app_key: key.id });
+      return { pc, code };
+    });
+  }
+  /** The pairings the operator has not kept or revoked yet, newest first, for Needs you ("Paired just now"). */
+  newPairings(): PairingRow[] {
+    return this.db.prepare(`SELECT p.id, p.machine_id, m.name AS pc_name, p.app_credential_id, p.paired_at, p.source, p.version, p.platform, p.status
+      FROM connector_pairings p LEFT JOIN machines m ON m.id=p.machine_id WHERE p.status='new' ORDER BY p.paired_at DESC`).all() as unknown as PairingRow[];
+  }
+  private newPairing(id: string): PairingRow {
+    const p = this.db.prepare('SELECT p.*, m.name AS pc_name FROM connector_pairings p LEFT JOIN machines m ON m.id=p.machine_id WHERE p.id=?').get(id) as unknown as PairingRow | undefined;
+    if (!p) throw fail('not_found', 'Pairing not found');
+    if (p.status !== 'new') throw fail('invalid_state', `This pairing was already ${p.status === 'kept' ? 'kept' : 'revoked'}.`);
+    return p;
+  }
+  /** "It was me": the pairing stays and leaves Needs you. */
+  keepPairing(id: string, actor: Actor): { id: string; status: 'kept' } {
+    const p = this.newPairing(id);
+    this.db.prepare("UPDATE connector_pairings SET status='kept', decided_at=?, decided_by=? WHERE id=? AND status='new'").run(Date.now(), actorId(actor), p.id);
+    this.audit.event(actor, 'connector.pairing_keep', { kind: 'pc', id: p.machine_id }, { pairing: p.id, app_key: p.app_credential_id, source: p.source });
+    return { id: p.id, status: 'kept' };
+  }
+  /**
+   * Revoke after pairing (docs/onboarding.md#paired-just-now): the PC's app key is revoked, its open requests and pickups are
+   * cancelled, and every agent key picked up with that app key is revoked. The PC record stays; Re-enrol PC starts again.
+   */
+  revokePairing(id: string, actor: Actor): { id: string; status: 'revoked'; requests_cancelled: number; agent_keys_revoked: number } {
+    const now = Date.now();
+    // Everything is read and changed in one transaction, so a pickup that lands in between cannot keep its key.
+    const { p, open, agentKeys } = tx(this.db, () => {
+      const p = this.newPairing(id);
+      const open = this.db.prepare("SELECT id FROM onboarding_requests WHERE app_credential_id=? AND state IN ('submitted','needs_changes','approved')").all(p.app_credential_id) as { id: string }[];
+      const agentKeys = (this.db.prepare(`SELECT DISTINCT s.credential_id AS id FROM onboarding_slots s JOIN onboarding_requests r ON r.id=s.request_id JOIN credentials c ON c.id=s.credential_id
+        WHERE r.app_credential_id=? AND c.status<>'revoked'`).all(p.app_credential_id) as { id: string }[]).map((x) => x.id);
+      // The requests first, so nothing can be picked up between the steps; then the agent keys, then the app key.
+      for (const r of open) {
+        this.db.prepare("UPDATE onboarding_slots SET status='closed' WHERE request_id=? AND status<>'confirmed'").run(r.id);
+        this.db.prepare("UPDATE onboarding_requests SET state='cancelled', pickup_id=NULL, operator_note=?, version=version+1, updated_at=?, decided_at=COALESCE(decided_at, ?) WHERE id=?").run('The PC\'s pairing was revoked.', now, now, r.id);
+        this.history(r.id, actor, 'cancelled', { reason: 'pairing_revoked', pairing: p.id });
+      }
+      for (const k of agentKeys) this.keys.setStatus(k, 'revoked', 'pairing_revoked', actor);
+      const app = this.keys.credential(p.app_credential_id);
+      if (app && app.status !== 'revoked') this.keys.setStatus(app.id, 'revoked', 'pairing_revoked', actor);
+      this.db.prepare("UPDATE connector_pairings SET status='revoked', decided_at=?, decided_by=? WHERE id=?").run(now, actorId(actor), p.id);
+      return { p, open, agentKeys };
+    });
+    this.audit.event(actor, 'connector.pairing_revoke', { kind: 'pc', id: p.machine_id }, { pairing: p.id, app_key: p.app_credential_id, source: p.source, requests_cancelled: open.length, agents_revoked: agentKeys.length });
+    for (const r of open) this.changed(r.id);
+    return { id: p.id, status: 'revoked', requests_cancelled: open.length, agent_keys_revoked: agentKeys.length };
+  }
+  // ───────────── collaborator invites (docs/onboarding.md#an-invite-for-a-collaborator) ─────────────
+  /**
+   * The owner's folder grants that hold each folder (the most specific grant decides), or the problems that refuse it: a
+   * folder outside every grant, hidden from the owner, or a write under a Read grant. One rule for vault agents and invites.
+   */
+  private ownerFolders(owner: string, folders: FolderIn[]): { problems: string[]; delegated: { grant: string; path: string; mode: 'read' | 'contribute' }[]; grants: { path: string; mode: string; delegation: string }[] } {
+    const u = this.db.prepare('SELECT external FROM admin_users WHERE id=?').get(owner) as { external: number } | undefined;
+    const grants = this.db.prepare('SELECT path, mode, delegation FROM user_folder_grants WHERE user_id=?').all(owner) as { path: string; mode: string; delegation: string }[];
+    const scope = new MemberScope(this.db, owner, !!u?.external);
+    const root = `/${this.d.vault.alias}`, problems: string[] = [], delegated: { grant: string; path: string; mode: 'read' | 'contribute' }[] = [];
+    for (const f of folders) {
+      const rel = `${f.path.slice(root.length)}/`.replace(/^\/*/, '/');
+      const g = grants.filter((x) => rel.toLowerCase().startsWith(x.path.toLowerCase())).sort((a, b) => b.path.length - a.path.length)[0];
+      if (!g) { problems.push(`${f.path} is not inside a folder shared with the owner`); continue; }
+      if (!scope.canSee(rel, true)) { problems.push(`${f.path} is restricted and hidden from the owner`); continue; }
+      if (f.access === 'write' && g.mode !== 'contribute') { problems.push(`${f.path}: the owner's grant on ${g.path} is Read, so the agent cannot write there`); continue; }
+      delegated.push({ grant: g.path, path: rel, mode: f.access === 'write' ? 'contribute' : 'read' });
+    }
+    return { problems, delegated, grants };
+  }
+  /** Delegate each checked folder to the owner's agents within the grant that holds it (Contribute only under a Contribute grant). */
+  private delegate(owner: string, f: { delegated: { grant: string; path: string; mode: 'read' | 'contribute' }[]; grants: { path: string; delegation: string }[] }): void {
+    for (const g of f.grants) {
+      const add = f.delegated.filter((d) => d.grant === g.path);
+      if (!add.length) continue;
+      const cur = parse<{ folders?: { path: string; mode: 'read' | 'contribute' }[] }>(g.delegation, {}).folders ?? [];
+      for (const d of add) {
+        const same = cur.find((x) => x.path.toLowerCase() === d.path.toLowerCase());
+        if (!same) cur.push({ path: d.path, mode: d.mode });
+        else if (d.mode === 'contribute') same.mode = 'contribute';
+      }
+      this.db.prepare('UPDATE user_folder_grants SET delegation=? WHERE user_id=? AND path=?').run(JSON.stringify({ folders: cur }), owner, g.path);
+    }
+  }
+  private inviteRow(id: string): InviteRow {
+    const v = typeof id === 'string' ? this.db.prepare('SELECT * FROM onboarding_invites WHERE id=?').get(id) as unknown as InviteRow | undefined : undefined;
+    if (!v) throw fail('not_found', 'Invite not found');
+    return v;
+  }
+  /** An open invite past its end becomes expired the first time anyone looks at it. */
+  private live(v: InviteRow): InviteRow {
+    if (v.status === 'open' && v.expires_at <= Date.now()) {
+      this.db.prepare("UPDATE onboarding_invites SET status='expired', ended_at=? WHERE id=? AND status='open'").run(Date.now(), v.id);
+      return { ...v, status: 'expired' };
+    }
+    return v;
+  }
+  inviteView(v: InviteRow): InviteView {
+    const team = this.teams.team(v.team_id), u = this.db.prepare('SELECT username, display_name FROM admin_users WHERE id=?').get(v.owner_user_id) as { username: string; display_name: string | null } | undefined;
+    const pc = v.machine_id ? this.keys.machine(v.machine_id) : null;
+    return { id: v.id, team: { id: v.team_id, name: team?.name ?? v.team_id }, project: team?.project ?? null, role: v.role, team_role: v.team_role as TeamRole,
+      owner: { id: v.owner_user_id, name: u?.display_name || u?.username || v.owner_user_id }, folders: parse<FolderIn[]>(v.folders, []), template_id: v.template_id, bound: !!v.bound, relay_id: v.relay_id ?? null,
+      status: v.status, created_at: v.created_at, expires_at: v.expires_at, pc: pc ? { id: pc.id, name: pc.name } : null, code_opened_at: v.code_opened_at,
+      paired: v.machine_id ? !!this.db.prepare("SELECT 1 x FROM enrolment_codes WHERE machine_id=? AND status='confirmed'").get(v.machine_id) : false,
+      request_id: v.request_id, agent_id: v.agent_id, redeemed_at: v.redeemed_at };
+  }
+  /**
+   * Everything an invite needs to stay valid, checked when it is made and again, inside the transaction, when it is used:
+   * the team is live, the role exists in it, the owner is an active collaborator whose grants still hold the folders, the
+   * ceiling's template still exists and no checkout holds the team. Returns the refusal in plain words, or null.
+   */
+  private inviteProblem(v: { team_id: string; team_role: string; owner_user_id: string; folders: FolderIn[]; template_id: string | null }): string | null {
+    const team = this.teams.team(v.team_id);
+    if (!team) return 'The team no longer exists.';
+    if (team.status === 'done' || team.status === 'stopped') return `The team has ${team.status === 'done' ? 'ended' : 'stopped'}.`;
+    if (!this.db.prepare('SELECT 1 x FROM team_roles WHERE team_id=? AND role=?').get(v.team_id, v.team_role)) return `The team has no ${v.team_role} role any more.`;
+    const u = this.db.prepare('SELECT role, status, expires_at FROM admin_users WHERE id=?').get(v.owner_user_id) as { role: string; status: string; expires_at: number | null } | undefined;
+    if (!u || u.role !== 'member') return 'The invited person is not a collaborator on this hub.';
+    if (u.status !== 'active' || (u.expires_at !== null && u.expires_at <= Date.now())) return "The invited person's access has ended.";
+    const f = this.ownerFolders(v.owner_user_id, v.folders);
+    if (f.problems.length) return `The invited person's shared folders no longer cover the invite: ${f.problems.join('; ')}.`;
+    if (v.template_id && !this.keys.templates().some((t) => t.id === v.template_id)) return 'The permission template of the invite was removed.';
+    if (openCheckout(this.db, { teamId: v.team_id })) return 'The team is being checked out, so no agent can join it now.';
+    return null;
+  }
+  /** The invite's ceiling: its template's rules, else the rules its folders give (as an approval would make them). */
+  private inviteCeiling(v: { folders: FolderIn[]; template_id: string | null }): Omit<Rule, 'id'>[] {
+    const t = v.template_id ? this.keys.templates().find((x) => x.id === v.template_id) : null;
+    const rules = t ? t.rules.map(({ id: _i, ...x }) => ({ ...x, from_template: `${t.name}@${t.version}` })) : this.folderRules(v.folders);
+    validateRules(rules);
+    return rules;
+  }
+  /**
+   * The operator invites a collaborator to one team and role (POST /api/invites). Creating it is the approval: the folders
+   * and the ceiling are checked here as an approval checks them, and nothing the PC sends later can widen them.
+   */
+  createInvite(a: { team_id: string; role?: string | null; team_role: string; owner_id: string; folders?: FolderIn[]; template_id?: string | null; bound?: boolean; days?: number; relay_id?: string | null }, actor: Actor): InviteView {
+    if (!(TEAM_ROLES as readonly string[]).includes(a.team_role)) throw fail('invalid_argument', `team_role: one of ${TEAM_ROLES.join(', ')}`);
+    const role = (a.role ?? a.team_role).trim();
+    if (!ROLE_RE.test(role)) throw fail('invalid_argument', 'role: lowercase letters, digits and _, at most 30 characters, starting with a letter');
+    const problems: string[] = [];
+    const folders = this.foldersIn(a.folders ?? [], 'folders', (field, rule) => problems.push(`${field}: ${rule}`));
+    if (problems.length) throw fail('invalid_argument', problems.join('; '));
+    const days = a.days ?? 7;
+    if (!Number.isInteger(days) || days < 1 || days > 90) throw fail('invalid_argument', 'days: a whole number from 1 to 90');
+    const v = { team_id: a.team_id, team_role: a.team_role, owner_user_id: a.owner_id, folders, template_id: a.template_id ?? null };
+    const why = this.inviteProblem(v);
+    if (why) throw fail('invalid_state', why);
+    this.inviteCeiling(v);
+    const id = `inv_${randomToken(10)}`, now = Date.now();
+    this.db.prepare('INSERT INTO onboarding_invites(id,team_id,role,team_role,owner_user_id,folders,template_id,bound,relay_id,created_by,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(id, a.team_id, role, a.team_role, a.owner_id, JSON.stringify(folders), v.template_id, a.bound === false ? 0 : 1, a.relay_id ?? null, actor.id, now, now + days * DAY);
+    this.audit.event(actor, 'onboarding.invite_created', { kind: 'team', id: a.team_id }, { invite: id, role, team_role: a.team_role, owner: a.owner_id, folders: folders.length, template: v.template_id, days, relay: a.relay_id ?? null });
+    return this.inviteView(this.inviteRow(id));
+  }
+  /** The operator's list (GET /api/invites): newest first; ended ones too, for the record. */
+  invites(): InviteView[] {
+    return (this.db.prepare('SELECT * FROM onboarding_invites ORDER BY created_at DESC LIMIT 200').all() as unknown as InviteRow[]).map((v) => this.inviteView(this.live(v)));
+  }
+  /** A collaborator's own invites (GET /api/me/invites): only theirs, and only the ones still open. */
+  myInvites(userId: string): InviteView[] {
+    return (this.db.prepare("SELECT * FROM onboarding_invites WHERE owner_user_id=? AND status='open' ORDER BY created_at DESC").all(userId) as unknown as InviteRow[])
+      .map((v) => this.live(v)).filter((v) => v.status === 'open').map((v) => this.inviteView(v));
+  }
+  /** The operator withdraws an invite: its unused code is void and its PC record's key revoked, unless the agent already joined. */
+  revokeInvite(id: string, actor: Actor): InviteView {
+    const v = this.live(this.inviteRow(id));
+    if (v.status !== 'open') throw fail('invalid_state', `The invite is already ${v.status}.`);
+    tx(this.db, () => {
+      this.db.prepare("UPDATE onboarding_invites SET status='revoked', ended_at=?, ended_by=? WHERE id=? AND status='open'").run(Date.now(), actor.id, v.id);
+      if (v.machine_id) {
+        this.revokeCodes(v.machine_id, ['unused']);
+        const key = this.pcKey(v.machine_id);
+        if (key && key.status !== 'revoked') this.keys.setStatus(key.id, 'revoked', 'invite_revoked', actor);
+      }
+    });
+    this.audit.event(actor, 'onboarding.invite_revoked', { kind: 'team', id: v.team_id }, { invite: v.id, owner: v.owner_user_id });
+    return this.inviteView(this.inviteRow(v.id));
+  }
+  /**
+   * The collaborator opens the pairing code (POST /api/me/invites/:id/code), in their own console behind sign-in and
+   * two-factor. The first opening makes the invite's PC record and its onboarding key; each opening makes a new code that
+   * works for 30 minutes from now, and voids the one before. Once the PC has paired, no code is shown again.
+   */
+  openInviteCode(id: string, userId: string): { invite: InviteView; pc: Machine; code: string } {
+    const v = this.live(this.inviteRow(id));
+    if (v.owner_user_id !== userId) throw fail('not_found', 'Invite not found');
+    if (v.status !== 'open') throw fail('invalid_state', `This invite is ${v.status}. Ask the operator for a new one.`);
+    const u = this.db.prepare('SELECT totp_secret FROM admin_users WHERE id=?').get(userId) as { totp_secret: string | null } | undefined;
+    if (!u?.totp_secret) throw fail('totp_required', 'Set up two-factor sign-in first: the pairing code is shown only behind it.');
+    const why = this.inviteProblem({ ...v, folders: parse<FolderIn[]>(v.folders, []) });
+    if (why) throw fail('invalid_state', why);
+    const actor: Actor = { kind: 'admin', id: userId };
+    const out = tx(this.db, () => {
+      let pc = v.machine_id ? this.keys.machine(v.machine_id) : null;
+      if (pc && this.db.prepare("SELECT 1 x FROM enrolment_codes WHERE machine_id=? AND status='confirmed'").get(pc.id)) throw fail('invalid_state', 'Your PC has paired with this invite already, so there is no code to show.');
+      let key = pc ? this.pcKey(pc.id) : null;
+      if (!pc) {
+        const owner = this.db.prepare('SELECT username, display_name FROM admin_users WHERE id=?').get(userId) as { username: string; display_name: string | null };
+        const team = this.teams.team(v.team_id)!;
+        // The PC name rule (lowercase letters, digits and dashes, at most 63): the collaborator, the team and the role.
+        const base = (slug(`${owner.username}-${team.name}-${v.role}`).slice(0, 56).replace(/-+$/, '')) || 'invite';
+        let name = base;
+        for (let i = 2; this.db.prepare('SELECT 1 x FROM machines WHERE name=?').get(name); i++) name = `${base}-${i}`;
+        pc = this.keys.createMachine(name, `Invite ${v.id} for ${owner.display_name || owner.username}: ${team.name}, ${v.role}`, actor);
+        this.db.prepare('UPDATE onboarding_invites SET machine_id=? WHERE id=?').run(pc.id, v.id);
+      }
+      if (!key || key.status !== 'active') key = this.newPcKey(pc, actor);
+      this.revokeCodes(pc.id, ['unused']);
+      const code = this.newCode(pc.id, key.id);
+      this.db.prepare('UPDATE onboarding_invites SET code_opened_at=? WHERE id=?').run(this.now(), v.id);
+      return { pc, code };
+    });
+    this.audit.event({ kind: 'admin', id: userId }, 'onboarding.invite_code_opened', { kind: 'pc', id: out.pc.id }, { invite: v.id });
+    return { invite: this.inviteView(this.inviteRow(v.id)), ...out };
+  }
+  /** The open invite a PC was paired for, or null for a PC the operator added (an operator code). */
+  private inviteOf(app: Credential): InviteRow | null {
+    return app.machine_id ? (this.db.prepare("SELECT * FROM onboarding_invites WHERE machine_id=? ORDER BY created_at DESC LIMIT 1").get(app.machine_id) as unknown as InviteRow | undefined) ?? null : null;
+  }
+  /**
+   * GET /onboard/choices (the PC's app key, after pairing): what the agent may ask about. A PC the operator added gets the
+   * projects and their live teams with their roles, for its first question. An invite's PC gets its one team and role, and no
+   * list. Before pairing there is no app key, so an unused code reveals nothing.
+   */
+  choices(app: Credential): { kind: 'pc'; projects: { name: string; teams: { id: string; name: string; roles: string[] }[] }[] } | { kind: 'invite'; invite: { id: string; project: string | null; team: { id: string; name: string }; role: string; status: string } } {
+    this.requireCapability(app, 'listing choices');
+    const inv = this.inviteOf(app);
+    if (inv) { const v = this.inviteView(this.live(inv)); return { kind: 'invite', invite: { id: v.id, project: v.project, team: v.team, role: v.role, status: v.status } }; }
+    // Every project (a new team may go into any of them), but only the teams onboarded from this PC: add_agents takes no other (onboardedTeam).
+    const teams = this.db.prepare("SELECT t.id, t.name, t.project FROM teams t WHERE t.status IN ('draft','running','paused') AND EXISTS (SELECT 1 FROM onboarding_requests r WHERE r.team_id=t.id AND r.state='collected' AND r.machine_id=? AND r.kind IN ('new_team','checkout')) ORDER BY t.name").all(app.machine_id ?? '') as { id: string; name: string; project: string | null }[];
+    const roles = this.db.prepare('SELECT team_id, role FROM team_roles ORDER BY role').all() as { team_id: string; role: string }[];
+    const byProject = new Map<string, { id: string; name: string; roles: string[] }[]>();
+    for (const p of this.projects()) byProject.set(p, []);
+    for (const t of teams) {
+      const p = t.project ?? '';
+      if (!byProject.has(p)) byProject.set(p, []);
+      byProject.get(p)!.push({ id: t.id, name: t.name, roles: roles.filter((r) => r.team_id === t.id).map((r) => r.role) });
+    }
+    return { kind: 'pc', projects: [...byProject].filter(([n]) => n).map(([name, ts]) => ({ name, teams: ts })) };
+  }
+  /**
+   * POST /onboard/invites/:id/redeem (the invite's PC, after pairing): in one transaction the invite is checked again, the
+   * agent is created (owned by the collaborator, with the invite's role) and an approved add_agents request with one slot is
+   * filed for this PC, which the connector picks up by itself. The PC sends nothing that could widen it: no goal, job, rules
+   * or folders. A refusal creates nothing and the console shows why.
+   */
+  redeemInvite(app: Credential, id: string, source: string): ReturnType<Onboarding['statusView']> {
+    this.requireCapability(app, 'joining');
+    const inv = this.inviteOf(app);
+    if (!inv || inv.id !== id) throw fail('not_found', 'Not allowed, or does not exist.');
+    if (inv.status === 'redeemed' && inv.request_id) return this.statusView(this.request(inv.request_id)!);
+    // The refusal is audited after the transaction rolled back, so the audit row is kept.
+    let refused: string | null = null;
+    const refuse = (reason: string): never => { refused = reason; throw fail('invite_refused', reason); };
+    let reqId: string;
+    try { reqId = tx(this.db, () => {
+      const v = this.live(this.inviteRow(inv.id));
+      if (v.status !== 'open') return refuse(`The invite is ${v.status}.`);
+      const folders = parse<FolderIn[]>(v.folders, []);
+      const why = this.inviteProblem({ ...v, folders });
+      if (why) return refuse(why);
+      const team = this.teams.team(v.team_id)!, pc = this.keys.machine(app.machine_id!)!;
+      const rules = this.inviteCeiling({ folders, template_id: v.template_id });
+      const project = team.project ?? team.name;
+      const n = (this.db.prepare('SELECT COUNT(*) n FROM team_members m JOIN agents a ON a.id=m.agent_id WHERE m.team_id=? AND a.role=?').get(team.id, v.role) as { n: number }).n;
+      const label = `${team.name} ${v.role}${n ? ` ${n + 1}` : ''}`;
+      const names = this.uniqueOnPc(pc.id, `${up(project)}_${up(team.name)}_${up(v.role)}${n ? `_${n + 1}` : ''}`, slug(label) || 'agent');
+      const job = `Invited as ${v.role} of team ${team.name}.`;
+      const body: RequestIn = { kind: 'add_agents', project: { name: project, existing: true }, team: { id: team.id }, roles: [{ name: v.role, team_role: v.team_role as TeamRole, count: 1, job, ...(folders.length ? { folders } : {}) }], prompt: `Invite ${v.id}.` };
+      const agent = this.keys.createAgent(label, project, sys, v.owner_user_id);
+      this.db.prepare("UPDATE agents SET role=?, role_detail=?, role_source='admin' WHERE id=?").run(v.role, job, agent.id);
+      // The folders are delegated within the owner's grants, as a vault agent's approval does.
+      this.delegate(v.owner_user_id, this.ownerFolders(v.owner_user_id, folders));
+      this.teams.createRolePlaybook(team.id, v.team_role);
+      const rid = `obr_${randomToken(10)}`, now = this.now();
+      this.db.prepare(`INSERT INTO onboarding_requests(id,app_credential_id,machine_id,kind,state,version,body,approved_body,team_id,start_when_set_up,filed_at,updated_at,waiting_since,decided_at) VALUES (?,?,?,'add_agents','approved',1,?,?,?,0,?,?,?,?)`)
+        .run(rid, app.id, pc.id, JSON.stringify(body), JSON.stringify(body), team.id, now, now, now, now);
+      this.db.prepare(`INSERT INTO onboarding_slots(id,request_id,slot,agent_id,role,team_role,label,session_var,folder,bound,template_id,ceiling,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'waiting',?)`)
+        .run(`obs_${randomToken(8)}`, rid, v.role, agent.id, v.role, v.team_role, label, names.session_var, names.folder, v.bound, v.template_id, JSON.stringify(rules), now);
+      this.db.prepare("UPDATE onboarding_invites SET status='redeemed', request_id=?, agent_id=?, redeemed_at=? WHERE id=? AND status='open'").run(rid, agent.id, now, v.id);
+      this.history(rid, sys, 'invite_redeemed', { invite: v.id, agent: agent.id, owner: v.owner_user_id });
+      return rid;
+    }); } catch (e) {
+      if (refused) this.audit.event(sys, 'onboarding.invite_refused', { kind: 'team', id: inv.team_id }, { invite: inv.id, reason: refused, source });
+      throw e;
+    }
+    this.audit.event(sys, 'onboarding.invite_redeemed', { kind: 'onboarding_request', id: reqId }, { invite: inv.id, team: inv.team_id, owner: inv.owner_user_id, pc: app.machine_id, source });
+    this.changed(reqId);
+    return this.statusView(this.request(reqId)!);
+  }
+
   enrolment(machineId: string): { status: string; created_at: number; used_at: number | null; confirmed_at: number | null } | null {
     return (this.db.prepare("SELECT status, created_at, used_at, confirmed_at FROM enrolment_codes WHERE machine_id=? AND expires_at IS NULL AND status<>'revoked' ORDER BY created_at DESC LIMIT 1").get(machineId) as never) ?? null;
   }
@@ -532,7 +851,7 @@ export class Onboarding {
    * for the app key, once, within 30 minutes, and only for this hub's origin and CA. A binding that names another hub
    * voids the code. Every refusal is the same 401 sentence; the audit keeps the real reason.
    */
-  pair(code: unknown, given: { origin: unknown; caSha256: unknown }, hub: { id: string; origin: string | null; caSha256: string | null }, source: string): { app_key: string; hub: { id: string; origin: string }; pc: { id: string; name: string } } {
+  pair(code: unknown, given: { origin: unknown; caSha256: unknown }, hub: { id: string; origin: string | null; caSha256: string | null }, source: string, reported: { version?: unknown; platform?: unknown } = {}): { app_key: string; hub: { id: string; origin: string }; pc: { id: string; name: string }; code_kind: 'pc' | 'invite'; invite?: { id: string; project: string | null; team: { id: string; name: string }; role: string } } {
     const lim = this.enrolLimit(), scope = `ip:${source}`;
     const b = lim.blocked(scope, 'enrol_fail');
     if (b.blocked) throw fail('rate_limited', 'Too many failed pairing attempts from this address. Try again later.', { retry_after_s: Math.ceil(b.retryAfterMs / 1000) });
@@ -563,10 +882,16 @@ export class Onboarding {
       const r = this.keys.reissueSecret(key.id, 'pairing');
       const now = this.now();
       this.db.prepare("UPDATE enrolment_codes SET status='confirmed', issues=issues+1, used_at=?, confirmed_at=?, enrolled_from=? WHERE id=? AND status='unused'").run(now, now, source, row.id);
+      // "Paired just now" (docs/onboarding.md#paired-just-now): a Needs you item until the operator keeps or revokes it.
+      this.db.prepare("INSERT INTO connector_pairings(id,machine_id,app_credential_id,code_id,paired_at,source,version,platform,status) VALUES (?,?,?,?,?,?,?,?,'new')")
+        .run(`cpr_${randomToken(8)}`, pc.id, key.id, row.id, now, source, short(reported.version, VERSION_TEXT), short(reported.platform, 20));
       return r;
     });
-    this.audit.event(sys, 'connector.pair', { kind: 'pc', id: pc.id }, { app_key: key.id, hub_id: hub.id, source });
-    return { app_key: issued.secret, hub: { id: hub.id, origin: hub.origin }, pc: { id: pc.id, name: pc.name } };
+    this.audit.event(sys, 'connector.paired', { kind: 'pc', id: pc.id }, { app_key: key.id, hub_id: hub.id, source, version: short(reported.version, VERSION_TEXT), platform: short(reported.platform, 20) });
+    // The code knows what it is for (docs/onboarding.md#the-code): an invite's PC joins its one team and role and asks nothing.
+    const inv = this.db.prepare("SELECT * FROM onboarding_invites WHERE machine_id=? AND status='open'").get(pc.id) as unknown as InviteRow | undefined;
+    const iv = inv ? this.inviteView(inv) : null;
+    return { app_key: issued.secret, hub: { id: hub.id, origin: hub.origin }, pc: { id: pc.id, name: pc.name }, code_kind: iv ? 'invite' : 'pc', ...(iv ? { invite: { id: iv.id, project: iv.project, team: iv.team, role: iv.role } } : {}) };
   }
 
   // ───────────── the PC key ─────────────
@@ -952,6 +1277,10 @@ export class Onboarding {
   private pendingOf(appId: string): RequestRow | null {
     return (this.db.prepare(`SELECT * FROM onboarding_requests WHERE app_credential_id=? AND ${PENDING} ORDER BY filed_at LIMIT 1`).get(appId) as unknown as RequestRow) ?? null;
   }
+  /** An open key handover bound to this app key (keys/handover.ts): approved, not confirmed, not expired. */
+  private openHandoverOf(appId: string): RequestRow | null {
+    return (this.db.prepare("SELECT * FROM onboarding_requests WHERE app_credential_id=? AND state='approved' AND handover IS NOT NULL AND expires_at>? ORDER BY filed_at LIMIT 1").get(appId, this.now()) as unknown as RequestRow) ?? null;
+  }
   private teamName(r: RequestRow, names?: Map<string, string>): string {
     const b = parse<RequestIn | null>(r.approved_body ?? r.body, null);
     const live = r.team_id ? (names ? names.get(r.team_id) : this.teams.team(r.team_id)?.name) : undefined;
@@ -967,6 +1296,8 @@ export class Onboarding {
 
   file(app: Credential, raw: unknown): ReturnType<Onboarding['statusView']> {
     this.requireCapability(app, 'filing');
+    // A PC paired with an invite joins its one team and role (POST /onboard/invites/:id/redeem); it cannot ask for a goal, rules or folders.
+    if (this.inviteOf(app)) throw fail('invalid_state', 'This PC was paired with an invite: it joins the invited team and role, and files no requests of its own.');
     this.fileLimit(app);
     this.scan(app, raw);
     const pend = this.pendingOf(app.id);
@@ -974,6 +1305,14 @@ export class Onboarding {
       this.audit.event(sys, 'onboarding.request_refused_pending', { kind: 'onboarding_request', id: pend.id }, { app_key: app.id });
       const step = pend.state === 'submitted' ? 'the approval' : pend.state === 'approved' ? 'key pickup' : 'your changes';
       throw fail('invalid_state', `This PC already has a pending request: \`${pend.id}\` "${this.teamName(pend)}", filed ${iso(pend.filed_at)}, waiting for ${step}.`, { pending: { request_id: pend.id, state: pend.state, team: this.teamName(pend), filed_at: pend.filed_at } });
+    }
+    // An open key handover still counts as the PC key's one pending request (docs/onboarding.md, key handover, "What it is").
+    const hand = this.openHandoverOf(app.id);
+    if (hand) {
+      this.audit.event(sys, 'onboarding.request_refused_pending', { kind: 'onboarding_request', id: hand.id }, { app_key: app.id, handover: hand.handover });
+      const what = hand.handover === 'recruit' ? `a new agent for team "${this.teamName(hand)}"` : 'a rotated key';
+      throw fail('invalid_state', `This PC already has a pending request: a key handover (${what}), filed ${iso(hand.filed_at)}, waiting for the PC user to allow it on the connector's screen. File again once it is confirmed, cancelled or expired.`,
+        { pending: { request_id: hand.id, state: hand.state, handover: hand.handover, filed_at: hand.filed_at } });
     }
     const v = this.validate(raw, app.machine_id);
     if (!v.req) throw fail('invalid_argument', v.problems.map((p) => `${p.field}: ${p.rule}`).join('; '), { problems: v.problems });
@@ -1401,7 +1740,12 @@ export class Onboarding {
   cancelRecruits(teamId: string, actor: Actor): number {
     const rows = this.db.prepare("SELECT id, body, handover FROM onboarding_requests WHERE team_id=? AND state='approved' AND kind='add_agents'").all(teamId) as { id: string; body: string; handover: string | null }[];
     let n = 0;
-    for (const r of rows) if (parse<RequestIn | null>(r.body, null)?.recruit) { this.cancel(r.id, 'Recruiting ended for the team.', actor, !!r.handover); n++; }
+    for (const r of rows) if (parse<RequestIn | null>(r.body, null)?.recruit) {
+      // A handover (connector PC) ends through the handover's own cancel, so it has the same audit as any other (team_ended).
+      if (r.handover && this.d.handovers) this.d.handovers.cancel(r.id, 'team_ended', actor);
+      else this.cancel(r.id, 'Recruiting ended for the team.', actor, !!r.handover);
+      n++;
+    }
     return n;
   }
 
@@ -1438,20 +1782,10 @@ export class Onboarding {
     const owner = p.owner_id ?? null;
     if (!owner) throw fail('invalid_argument', 'owner_id: a vault agent needs an owner, the collaborator whose shared folders bound it.');
     this.keys.checkOwner(owner);
-    const u = this.db.prepare('SELECT role, external FROM admin_users WHERE id=?').get(owner) as { role: string; external: number };
+    const u = this.db.prepare('SELECT role FROM admin_users WHERE id=?').get(owner) as { role: string };
     if (u.role !== 'member') throw fail('invalid_argument', 'owner_id: the owner of a vault agent is a collaborator with shared folders; an admin has no folder grant to bound it.');
-    const grants = this.db.prepare('SELECT path, mode, delegation FROM user_folder_grants WHERE user_id=?').all(owner) as { path: string; mode: string; delegation: string }[];
-    const scope = new MemberScope(this.db, owner, !!u.external);
-    const root = `/${this.d.vault.alias}`, problems: string[] = [], delegated: { grant: string; path: string; mode: 'read' | 'contribute' }[] = [];
-    for (const f of folders) {
-      const rel = `${f.path.slice(root.length)}/`.replace(/^\/*/, '/');
-      // The most specific grant decides: with Read on a parent and Contribute on an inner folder, the inner folder is Contribute.
-      const g = grants.filter((x) => rel.toLowerCase().startsWith(x.path.toLowerCase())).sort((a, b) => b.path.length - a.path.length)[0];
-      if (!g) { problems.push(`${f.path} is not inside a folder shared with the owner`); continue; }
-      if (!scope.canSee(rel, true)) { problems.push(`${f.path} is restricted and hidden from the owner`); continue; }
-      if (f.access === 'write' && g.mode !== 'contribute') { problems.push(`${f.path}: the owner's grant on ${g.path} is Read, so the agent cannot write there`); continue; }
-      delegated.push({ grant: g.path, path: rel, mode: f.access === 'write' ? 'contribute' : 'read' });
-    }
+    // The most specific grant decides: with Read on a parent and Contribute on an inner folder, the inner folder is Contribute.
+    const { problems, delegated, grants } = this.ownerFolders(owner, folders);
     if (problems.length) throw fail('invalid_argument', `folders: ${problems.join('; ')}`, { problems: problems.map((rule) => ({ field: 'folders', rule })) });
     const c = (p.agents ?? []).find((a) => a.slot === VAULT_ROLE);
     for (const a of p.agents ?? []) if (a.slot !== VAULT_ROLE) throw fail('invalid_argument', `agents: no slot "${a.slot}" (slots: ${VAULT_ROLE})`);
@@ -1464,17 +1798,7 @@ export class Onboarding {
     const [s] = this.plan(req, r);
     const bound = c?.bound !== false, now = Date.now();
     // Delegate each folder to the owner's agents within its grant (a Contribute delegation only under a Contribute grant).
-    for (const g of grants) {
-      const add = delegated.filter((d) => d.grant === g.path);
-      if (!add.length) continue;
-      const cur = parse<{ folders?: { path: string; mode: 'read' | 'contribute' }[] }>(g.delegation, {}).folders ?? [];
-      for (const d of add) {
-        const same = cur.find((x) => x.path.toLowerCase() === d.path.toLowerCase());
-        if (!same) cur.push({ path: d.path, mode: d.mode });
-        else if (d.mode === 'contribute') same.mode = 'contribute';
-      }
-      this.db.prepare('UPDATE user_folder_grants SET delegation=? WHERE user_id=? AND path=?').run(JSON.stringify({ folders: cur }), owner, g.path);
-    }
+    this.delegate(owner, { delegated, grants });
     const agent = this.keys.createAgent(s!.label, null, actor, owner);
     this.db.prepare("UPDATE agents SET role=?, role_detail=?, role_source='admin' WHERE id=?").run(VAULT_ROLE, req.roles[0]!.job, agent.id);
     this.db.prepare(`INSERT INTO onboarding_slots(id,request_id,slot,agent_id,role,team_role,label,session_var,folder,bound,template_id,ceiling,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,'waiting',?)`)

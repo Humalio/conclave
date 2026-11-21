@@ -524,7 +524,7 @@ describe('usage', () => {
     expect(days()).toEqual([dayAgo(1), dayAgo(399)]);
     app.db.prepare("INSERT INTO system_settings(key,value,updated_at) VALUES ('retention.usage_days','30',?)").run(Date.now());
     await app.maintenance.run();
-    expect(days()).toEqual([dayAgo(1)]);
+    expect(days()).toEqual([dayAgo(1), dayAgo(399)]); // a lower setting is read as the floor (docs/operations.md)
     app.db.prepare("DELETE FROM system_settings WHERE key='retention.usage_days'").run();
   });
 });

@@ -26,14 +26,21 @@ export const ROLE_FILES = new Set(['claude.md', 'agents.md', 'agents.override.md
 /**
  * Why a local path may not be uploaded through the connector, on its name alone (the PC checks the real path again,
  * links and junctions resolved): `null` when the name is fine. Refused: an absolute path is required; `.git`, `.codex`,
- * the connector's folders (`.agent-hub`, `.config/conclave`) anywhere on the way; a role file.
+ * the connector's folders (`.agent-hub`, `.config/conclave`) anywhere on the way; a role file; and, on Windows, the other
+ * spellings of those names (`.git.`, `.git ` with a trailing space, `GIT~1`, an alternate stream) and device names (`CON`, `NUL`, `COM1`).
  */
 export function refusedLocalName(target: string, os: 'win32' | 'posix'): string | null {
   const p = os === 'win32' ? path.win32 : path.posix;
   if (!target || target.includes('\0') || !p.isAbsolute(target)) return 'is not an absolute path.';
-  const parts = p.normalize(target).split(/[\\/]+/).filter(Boolean).map((s) => s.toLowerCase());
-  if (parts.some((s) => REFUSED_DIRS.has(s))) return 'is inside .git, .codex or the connector\'s own folder.';
+  const raw = p.normalize(target).split(/[\\/]+/).filter(Boolean);
+  // Windows reads a name without its trailing dots and spaces and with a short 8.3 form; the PC resolves the real path again.
+  const canon = (s: string) => (os === 'win32' ? s.normalize('NFC').toLowerCase().replace(/:[^\\/]*$/, '').replace(/[. ]+$/, '') : s.toLowerCase());
+  const short = (s: string) => (os === 'win32' ? /^([^~.]{1,6})~\d+(?:\.[^.]{0,3})?$/.exec(s)?.[1] ?? null : null);
+  const parts = raw.map(canon);
+  if (os === 'win32' && parts.some((s) => /^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$/.test(s))) return 'is a Windows device name.';
+  if (parts.some((s) => REFUSED_DIRS.has(s) || ['git', 'codex', 'agent-'].includes(short(s) ?? ''))) return 'is inside .git, .codex or the connector\'s own folder.';
   if (parts.some((s, i) => s === '.config' && parts[i + 1] === 'conclave')) return 'is inside the connector\'s own folder.';
-  if (ROLE_FILES.has(parts.at(-1) ?? '')) return 'is a role file (CLAUDE.md, AGENTS.md or AGENTS.override.md).';
+  const last = parts.at(-1) ?? '';
+  if (ROLE_FILES.has(last) || ['claude', 'agents'].includes(short(last) ?? '')) return 'is a role file (CLAUDE.md, AGENTS.md or AGENTS.override.md).';
   return null;
 }

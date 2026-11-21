@@ -9,7 +9,10 @@ export const BASE_TOOLS = ['session_logout', 'session_whoami', 'session_describe
  */
 export const DEFAULT_TOOLS = ['feedback_find', 'feedback_file', 'feedback_read', 'feedback_add', 'directives_list', 'directives_read', 'directives_report',
   // Hardware (docs/hardware.md): the machine's team list is the authority, so no grant is needed; a deny on tool:hw_* refuses them.
-  'hw_list', 'hw_join', 'hw_report', 'hw_leave'] as const;
+  'hw_list', 'hw_join', 'hw_report', 'hw_leave',
+  // Without the channel grants it answers only for the caller's own task-file uploads (docs/transfers.md); any other channel needs
+  // tool:channel_status and channel.use, as before.
+  'channel_status'] as const;
 
 /** Tools that need an explicit `tool.invoke` grant on `tool:<name>`. */
 export const GRANTED_TOOLS = ['file_list', 'file_read', 'file_search', 'file_stat',
@@ -17,7 +20,7 @@ export const GRANTED_TOOLS = ['file_list', 'file_read', 'file_search', 'file_sta
   'agent_list', 'message_send', 'message_read', 'message_ack', 'message_history', 'room_list', 'room_create', 'room_join', 'room_leave', 'room_invite',
   'share_create', 'share_upload', 'share_list', 'share_info', 'share_read', 'share_diff', 'share_comment', 'share_suggest', 'share_feedback', 'share_resolve', 'share_download', 'share_promote', 'share_close',
   'graph_related', 'graph_impact', 'graph_query', 'graph_context', 'graph_summary', 'graph_job_submit', 'graph_upsert', 'graph_summary_write',
-  'channel_open', 'channel_list', 'channel_accept', 'channel_send', 'channel_receive', 'channel_status', 'channel_close', 'file_download'] as const;
+  'channel_open', 'channel_list', 'channel_accept', 'channel_send', 'channel_receive', 'channel_close', 'file_download'] as const;
 
 export const ALL_ACTIONS = [
   'tool.invoke',

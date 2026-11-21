@@ -8,7 +8,7 @@ An agent that needs a decision only the operator can make asks through the hub, 
 |---|---|
 | `team_ask` | Ask the operator. It takes these fields: <br>• `question`, at most 300 characters; <br>• `context`, optional; <br>• `options`: none for a free answer, or 2 to 6, each with a `key`, a `label` and an optional `effect`; <br>• `recommended`: the key of the option you recommend; <br>• `task_id`, optional; <br>• `refs`, optional: team plan keys or any key of the team's project blueprint (`FR-TEAM-04`, `ADR-012`); <br>• `decision`, optional: `true` turns the answer into an accepted decision entry (`ADR-n`, `source: team_ask:<id>`) in the project blueprint, governing the refs it can (FR, NFR, module, architecture). A `proposed` ADR named in `refs` is accepted by the answer either way. The answer notice names the ADR; a failure to record it never undoes the answer; <br>• `needed_by`, optional; <br>• `project`, optional: the project key the refs belong to. Keys are per project ([blueprint §3](blueprint.md#3-projects-and-team-parts)) and `team_id` already fixes the project, so a `project` that is not the team's is refused with the team's project named. The question records its project (`decisions.project_id`). |
 | `team_ask_update` | Your own open question: add `context` (also the reply when the operator asks for more), or `withdraw: true`. Correct the `options` or `recommended` (see [Correcting the options](#correcting-the-options)). A coordinator also records an answer the operator gave outside the hub: `relayed_answer`, `chosen` and `source` (see [Relayed answers](#relayed-answers)). |
-| `team_decisions` | The team's decision log, for any member: `status` open, closed or all. |
+| `team_decisions` | The team's decision log, for any member: `decision_id` for one question, otherwise `status` open (the default), closed or all. |
 
 Rules:
 - **Who may ask:** any team member. The coordinator gets a notice for every question a member asks.
@@ -66,8 +66,18 @@ The operator often answers outside the hub, in a chat with the coordinator. With
   - The hub's log is the record.
   - A failed vault write, for example a conflict or a lockdown, never undoes an answer.
 
+## Designs
+
+A design is a **Blueprint decision item** (`ADR-*`, status `proposed`) that the operator decides on its own screen. The coordinator files it with `bp_write` (the design in Markdown as the body; `review`, a field the reviewer writes itself; `mockups`, images attached to one of the team's tasks) and asks with `team_ask {decision: true, refs: [ADR-x], options, recommended}`. Every design goes to the operator this way; a file in the notes folder is only a working copy.
+
+- **Needs you:** a question that names a decision item is one row, **Design to decide · <title>**, instead of its ordinary question row. It opens the design screen, a large dialog (full screen on a phone).
+- **The screen:** the decision in one sentence and the recommendation; the design rendered from Markdown with its mockups inline (click for full size); "What changed after review". Agent text is marked: "Written by <agent>", "Reviewed by <agent>". The hub takes the reviewer from the item's revisions, never from the field, and says when the reviewer is the writer. Mockups are PNG, JPEG or WebP only; a GIF, an SVG or a document is never shown.
+- **The bottom bar:** the options (the recommended one first) are the ordinary answer. **Change…** is "ask for more" (`needs_info`; the decision stays `proposed`). **Reject** needs a reason and records the item as `rejected`, the reason in `consequences`. A relayed answer shows **Confirm** and **Overturn** instead.
+- **After answering:** one more step, **Keep the design** (the default) or **Archive the design**. Archive is the Blueprint's own archive: the item leaves the lists but keeps its key, links and history, and **Unarchive** brings it back. The answer stays in the team question and the audit either way. Archive is the administrator's.
+
 ## Data and API
 
+- `GET /api/decisions/:id/design` — the design a question names (item, review, who wrote and reviewed it, mockup list); `GET /api/decisions/:id/mockup/:n` — one mockup image. `POST /api/decisions/:id/answer` takes `reject: true` with a reason for a design.
 - **Tables:**
   - the `decisions` table;
   - the `teams.decision_log_path` column;

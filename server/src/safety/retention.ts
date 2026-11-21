@@ -4,6 +4,7 @@ import { tx } from '../db/db.js';
 import type { VaultStore } from '../vault/store.js';
 import type { Access } from '../access/access.js';
 import type { Alerts } from './alerts.js';
+import type { DbHealth } from './dbHealth.js';
 
 const DAY = 86400_000;
 export const BATCH = 5000;
@@ -16,6 +17,8 @@ export class Maintenance {
   private timer: NodeJS.Timeout | null = null;
   private lastRetention = 0;
   private running = false;
+  /** Database health (docs/operations.md): its nightly step runs from this scheduler. */
+  health: DbHealth | null = null;
   constructor(private readonly db: Db, private readonly store: VaultStore, private readonly access: Access, private readonly alerts: Alerts, private readonly cfg: RetentionConfig = DEFAULT_RETENTION) {}
 
   /** Start the single scheduler. Retention runs at most once an hour. */
@@ -32,15 +35,19 @@ export class Maintenance {
       this.access.expirePending(now);
       this.alerts.cleanup(now);
       if (now - this.lastRetention >= 3600_000) { this.lastRetention = now; await this.run(now); }
+      await this.health?.nightly(now);
     } catch (e) { console.error('maintenance failed', e); }
     finally { this.running = false; }
   }
 
-  /** Settings override the defaults: retention.shares_days, retention.channels_days, retention.work_items_days, retention.usage_days. */
+  /**
+   * Settings raise the defaults, never lower them (docs/operations.md, built-in rules): retention.shares_days,
+   * retention.channels_days, retention.work_items_days, retention.usage_days.
+   */
   private days(key: string, dflt: number): number {
     const r = this.db.prepare('SELECT value FROM system_settings WHERE key=?').get(key) as { value: string } | undefined;
     const n = r ? Number(JSON.parse(r.value)) : NaN;
-    return Number.isFinite(n) && n > 0 ? n : dflt;
+    return Number.isFinite(n) && n > dflt ? n : dflt;
   }
 
   async run(now = Date.now()): Promise<RetentionResult> {

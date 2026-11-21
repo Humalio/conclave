@@ -234,6 +234,15 @@ export function approvePickup(home, key) {
   atomicWrite(pendingPath(home), JSON.stringify(p, null, 2) + '\n');
   return true;
 }
+/**
+ * The pickup of a request this PC itself filed, allowed with no click (docs/onboarding.md, "The prompt"). The request came from this connector and the
+ * keys go only to it, so there is nothing self-asserted to confirm. Not used at the hardened level, where the PC user is not the one who opens the keys.
+ * Spent like a click, when the pickup is made.
+ */
+export function allowOwnPickup(home, hubKey, requestId, what, folders = []) {
+  requestPickup(home, hubKey, requestId, what, folders);
+  return approvePickup(home, pickupKey(hubKey, requestId));
+}
 /** One pickup is allowed once: a click is spent when the pickup is made. */
 export function spendPickup(home, hubKey, requestId) {
   const a = load(approvalsPath(home)), k = pickupKey(hubKey, requestId);

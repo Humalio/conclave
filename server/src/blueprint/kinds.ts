@@ -66,7 +66,8 @@ export const KINDS: Record<string, KindSpec> = {
   architecture: { key: /^ARCH$/, format: 'ARCH (one per project)', example: 'ARCH', single: true, fields: {} },
   decision: {
     key: /^ADR-\d{3,}$/, format: 'ADR-nnn', example: 'ADR-007', pad: 3, statuses: ['proposed', 'accepted', 'superseded', 'rejected'],
-    fields: { context: 'str', options: 'objs', chosen: 'str', decided_at: 'num', decided_by: 'str', consequences: 'str', source: 'str', superseded_by: 'str' },
+    fields: { context: 'str', options: 'objs', chosen: 'str', decided_at: 'num', decided_by: 'str', consequences: 'str', source: 'str', superseded_by: 'str', review: 'obj', mockups: 'objs' },
+    note: 'A design the operator decides in the console (docs/decisions.md, Designs): the body is the design in Markdown. review: { verdict: approved or changes, changes: [text], summary } written by the reviewer itself; the hub shows who wrote it from the revision, not from this field. mockups: [{ task_id, role: brief or submission, path, caption }] name images attached to one of the team tasks (PNG, JPEG or WebP only; SVG is refused).',
   },
   paper: {
     key: /^PAP-\d+$/, format: 'PAP-n', example: 'PAP-1', pad: 0, statuses: ['planned', 'drafting', 'submitted', 'accepted', 'rejected', 'published', 'dropped'],

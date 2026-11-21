@@ -24,6 +24,8 @@ export interface Config {
   allowedOrigins: string[];
   /** Path of the bridge program served by setup_pc (default: found next to the server or in ../bridge). */
   bridgeFile?: string;
+  /** Requests per minute one address may make to the public routes (no key, session or cookie; default 300; 0 turns the limit off). */
+  publicRequestsPerMinute?: number;
   /** Messages one session key may send per hour (default 120). */
   messagesPerHour?: number;
   /** Seconds between full vault scans for external changes (default 60; 0 turns the periodic scan off). */
@@ -91,6 +93,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     channelBytesPerHour: env.CHANNEL_BYTES_PER_HOUR ? Number(env.CHANNEL_BYTES_PER_HOUR) : undefined, shareBytesPerHour: env.SHARE_BYTES_PER_HOUR ? Number(env.SHARE_BYTES_PER_HOUR) : undefined,
     retention: { ...(env.RETENTION_SHARES_DAYS ? { sharesDays: Number(env.RETENTION_SHARES_DAYS) } : {}), ...(env.RETENTION_CHANNELS_DAYS ? { channelsDays: Number(env.RETENTION_CHANNELS_DAYS) } : {}), ...(env.RETENTION_WORK_ITEMS_DAYS ? { workItemsDays: Number(env.RETENTION_WORK_ITEMS_DAYS) } : {}), ...(env.RETENTION_USAGE_DAYS ? { usageDays: Number(env.RETENTION_USAGE_DAYS) } : {}) },
     trustProxy: parseTrustProxy(env.TRUST_PROXY),
+    publicRequestsPerMinute: env.PUBLIC_REQUESTS_PER_MINUTE?.trim() && Number.isFinite(Number(env.PUBLIC_REQUESTS_PER_MINUTE)) ? Number(env.PUBLIC_REQUESTS_PER_MINUTE) : 300,
     lanUrl: env.LAN_URL ? env.LAN_URL.replace(/\/+$/, '') : undefined, caCertFile: env.CA_CERT_FILE || undefined, clientDir: env.CLIENT_DIR || undefined,
     allowedOrigins: (env.ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim().replace(/[/]+$/, '')).filter(Boolean),
     // Test and demo hubs (eval/run.mjs) shorten the indexing debounce so curator jobs appear within the run.

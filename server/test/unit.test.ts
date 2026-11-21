@@ -114,6 +114,22 @@ describe('leak guard', () => {
   });
 });
 
+describe('leak guard: pairing codes', () => {
+  // A pairing code has a fixed prefix (cnc-pair-), so the guard refuses it wherever it would be stored or sent (review v3, point a).
+  const CODE = 'cnc-pair-abcdefghijklmnopqrstuvwxyz';
+  const g = new LeakGuard({ isIssued: (k, _id, s) => k === 'pair' && `cnc-pair-${s}` === CODE });
+  it('reports an issued code, also spaced, upper-cased or base64, as issued', () => {
+    expect(g.scan({ text: `my code is ${CODE}` })).toMatchObject({ issued: true });
+    expect(g.scan('CNC-PAIR-ABCDEFGHIJKLMNOPQRSTUVWXYZ')).toMatchObject({ issued: true });
+    expect(g.scan('cnc pair abcdefghijklmnopqrstuvwxyz')).toMatchObject({ issued: true });
+    expect(g.scan(Buffer.from(CODE).toString('base64'))).toMatchObject({ issued: true });
+  });
+  it('reports a code-shaped string the hub never issued as not issued, and leaves the bare prefix alone', () => {
+    expect(g.scan('cnc-pair-zzzzzzzzzzzzzzzzzzzzzzzzzz')).toMatchObject({ issued: false });
+    expect(g.scan('Your code starts with cnc-pair- and is in the console.')).toBeNull();
+  });
+});
+
 describe('vault confinement', () => {
   const root = mkdtempSync(join(tmpdir(), 'vault-'));
   mkdirSync(join(root, 'Notes'), { recursive: true });

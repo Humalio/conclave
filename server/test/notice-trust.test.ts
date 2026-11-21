@@ -111,6 +111,27 @@ describe('notice builders keep agent text apart', () => {
     for (const b of allNotices()) expect(splitNotice(b.body).hub, b.kind).not.toContain(EVIL);
   });
 
+  it('the directive notices about a report keep the reporter title and source in the L2 part', async () => {
+    const rep = await agent('nt-reporter'), rep2 = await agent('nt-reporter2');
+    const src = `from ${EVIL}`;
+    const r1 = app.directives.report(rep.id, { title: EVIL, source: src, summary: 'A rule we follow' });
+    const r2 = app.directives.report(rep2.id, { title: EVIL, source: src, summary: 'Another rule' });
+    app.directives.dismiss(r1.id, null, sys);
+    const stop = lastNotice(rep.id, 'directive_changed'), sp = splitNotice(stop);
+    expect(sp.hub).not.toContain(EVIL);
+    expect(sp.l2).toEqual([EVIL, src]);
+    app.directives.adopt(r2.id, { title: 'Adopted rule', body: 'Do the thing' }, sys);
+    for (const b of allNotices().filter((n) => n.kind === 'directive_changed')) expect(splitNotice(b.body).hub, b.body).not.toContain(EVIL);
+    expect(splitNotice(lastNotice(rep2.id, 'directive_changed')).l2).toContain(EVIL);
+  });
+
+  it('the recruit decision notice keeps the agent-chosen label and folder in the L2 part, and the tool result shows them plainly', () => {
+    const rows = readFileSync(new URL('../src/teams/teams.ts', import.meta.url), 'utf8');
+    expect(rows).toContain('Teams.pickupText(q.label, r.pickup, true)');
+    const body = (app.db.prepare("SELECT body FROM agent_notices WHERE kind='recruit_decision' ORDER BY seq DESC LIMIT 1").get() as { body: string } | undefined)?.body;
+    if (body) expect(splitNotice(body).hub).not.toContain(EVIL);
+  });
+
   it('the console inbox shows a notice as one plain line with the text quoted', () => {
     const a = app.keys.createAgent('nt-inbox', null, sys);
     app.keys.notify(a.id, 'task_open', `A claimable task is open: ${l2(EVIL)} (tsk_x).`);

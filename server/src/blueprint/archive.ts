@@ -50,7 +50,8 @@ export class BlueprintArchive {
       return { keys: [key, ...kids.map((c) => c.key)], blocking: [] };
     }
     if (r.archived) throw err('invalid_state', `${key} is already archived.`);
-    if (!isRetired(r.kind, r.status)) throw err('invalid_state', `Only a dropped item can be archived; ${key} is ${r.status ?? 'without a status'}. Drop it first.`);
+    // A settled design (an accepted decision) is archived too, once the operator no longer wants it in the list: the item, its key and its links stay whole.
+    if (!isRetired(r.kind, r.status) && !(r.kind === 'decision' && r.status === 'accepted')) throw err('invalid_state', `Only a dropped item can be archived; ${key} is ${r.status ?? 'without a status'}. Drop it first.`);
     if (r.replan_id) throw err('invalid_state', `${key} is held by an open re-plan; finish or cancel it first.`);
     const kids = this.subtree(projectId, key, 0);
     // A descendant blocks while it is still in play: a kind that can be dropped and is not, or one an open re-plan holds.

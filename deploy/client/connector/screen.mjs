@@ -103,7 +103,7 @@ ${msg ? `<div class="msg ${msg.bad ? 'bad' : ''}">${esc(msg.text)}</div>` : ''}
 <form method="post" action="/pair" class="card" autocomplete="off">
 <label for="o">Hub address</label><input id="o" type="url" name="origin" required placeholder="https://hub.example:8443" value="${esc(origin)}">
 <label for="k">Hub check</label><input id="k" type="text" name="check" required placeholder="ab12 cd34 ef56 7890" value="${esc(check)}">
-<label for="c">Pairing code</label><input id="c" type="text" name="code" required placeholder="cnv_enrol_…" spellcheck="false">
+<label for="c">Pairing code</label><input id="c" type="text" name="code" required placeholder="cnc-pair-…" spellcheck="false">
 ${confirm ? '<label><input type="checkbox" name="confirm" value="1"> My administrator told me this hub\'s certificate or address changed.</label>' : ''}
 <p class="row"><button class="pri">Pair</button></p></form>`;
 }
@@ -224,7 +224,7 @@ export function needsHtml(p, origins, now = Date.now()) {
   const hubOf = (id) => (multi && origins.get(id) ? ` <span class="muted">on</span> ${hub(origins.get(id))}` : '');
   const folderRow = (f, denied) => `<div class="need"><div class="row between"><span><b>${hub(f.agent)}</b> ${chip(f.program === 'codex' ? 'codex' : 'claude')}<span class="muted"> ${esc(denied ? `denied ${ago(f.denied_at, now)}` : `asked ${ago(f.at, now)}`)}</span>${hubOf(f.hub_id)}</span><span class="row">${denied ? '' : form('/deny-folder', { key: f.key }, 'Deny')}${form('/allow-folder', { key: f.key }, 'Allow', 'pri')}</span></div><code class="path">${esc(f.folder)}</code>${f.config_changed ? '<div class="alert">The agent settings of this folder changed since it was registered. Allow it only if you made that change.</div>' : ''}</div>`;
   const pickupFolders = (k) => (k.folders?.length ? `<p class="muted">Allowing this also allows the first chat in ${k.folders.length === 1 ? 'this folder' : 'these folders'}, which the connector builds now:</p><ul class="paths">${k.folders.map((f) => `<li>${hub(f.agent)} <code class="path">${esc(f.path)}</code></li>`).join('')}</ul>` : '');
-  const pickupRow = (k, denied) => `<div class="need"><div class="row between"><span>Pick up keys from the hub${hubOf(k.hub_key)}. In the hub's words: <q>${esc(k.what ?? 'keys')}</q>. The click covers this one handover.<span class="muted"> ${esc(denied ? `denied ${ago(k.denied_at, now)}` : `asked ${ago(k.at, now)}`)}</span></span><span class="row">${denied ? '' : form('/deny-pickup', { key: k.key }, 'Deny')}${form('/allow-pickup', { key: k.key }, 'Allow', 'pri')}</span></div>${pickupFolders(k)}</div>`;
+  const pickupRow = (k, denied) => `<div class="need"><div class="row between"><span>Pick up keys from the hub${hubOf(k.hub_key)}. In the hub's words: <q>${hub(k.what ?? 'keys')}</q>. The click covers this one handover.<span class="muted"> ${esc(denied ? `denied ${ago(k.denied_at, now)}` : `asked ${ago(k.at, now)}`)}</span></span><span class="row">${denied ? '' : form('/deny-pickup', { key: k.key }, 'Deny')}${form('/allow-pickup', { key: k.key }, 'Allow', 'pri')}</span></div>${pickupFolders(k)}</div>`;
   let h = '';
   const waitingN = p.folders.length + p.pickups.length;
   if (waitingN) {

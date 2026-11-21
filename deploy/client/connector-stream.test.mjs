@@ -13,7 +13,7 @@ import https from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { validateOrder, wasHandled, markHandled } from './connector/orders.mjs';
+import { validateOrder, wasHandled, markHandled, ORDER_REASONS } from './connector/orders.mjs';
 import { pendingResults, queueResult, sendResult, flushOutbox } from './connector/outbox.mjs';
 import { runWorker } from './connector/worker.mjs';
 import { putHub, caFingerprint } from './connector/keyfile.mjs';
@@ -79,8 +79,8 @@ describe('what a delivery shows on the PC', () => {
 // ───────────── the stream and the worker against a stub hub ─────────────
 describe('the stream against a stub hub over HTTPS', { skip: OPENSSL ? false : 'openssl is not available on this PC' }, () => {
   let pki, hub, other;
-  const s = { streams: [], opens: 0, checkIns: 0, polls: 0, results: [], installs: new Set(), plain: 0 };
-  let queue = [], mode = 'stream', measureOnly = false, resultFail = 0, resultStatus = 200;
+  const s = { openTimes: [], streams: [], opens: 0, checkIns: 0, polls: 0, results: [], installs: new Set(), plain: 0 };
+  let retryAfter = 0, queue = [], mode = 'stream', measureOnly = false, resultFail = 0, resultStatus = 200;
 
   const serve = (p) => https.createServer({ key: p.key, cert: p.cert }, (req, res) => {
     let raw = '';
@@ -94,6 +94,7 @@ describe('the stream against a stub hub over HTTPS', { skip: OPENSSL ? false : '
         s.opens++; s.installs.add(url.searchParams.get('installation'));
         if (mode === 'blocked') return; // a proxy that never lets the stream open
         if (mode === 'missing') return json(404, { error: 'not_found' });
+        if (mode === 'ratelimit') { s.openTimes.push(Date.now()); res.writeHead(429, { 'content-type': 'application/json', ...(retryAfter ? { 'retry-after': String(retryAfter) } : {}) }); return res.end('{"error":"rate_limited"}'); }
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         res.write('event: orders\ndata: {}\n\n');
         s.streams.push(res);
@@ -120,7 +121,7 @@ describe('the stream against a stub hub over HTTPS', { skip: OPENSSL ? false : '
     });
   });
   const ping = () => { for (const r of s.streams) { try { r.write('event: orders\ndata: {}\n\n'); } catch { /* closed */ } } };
-  const reset = () => { for (const r of s.streams) { try { r.end(); } catch { /* closed */ } } Object.assign(s, { streams: [], opens: 0, checkIns: 0, polls: 0, results: [], installs: new Set(), plain: 0 }); queue = []; mode = 'stream'; measureOnly = false; };
+  const reset = () => { for (const r of s.streams) { try { r.end(); } catch { /* closed */ } } retryAfter = 0; Object.assign(s, { openTimes: [], streams: [], opens: 0, checkIns: 0, polls: 0, results: [], installs: new Set(), plain: 0 }); queue = []; mode = 'stream'; measureOnly = false; };
 
   before(async () => {
     pki = makePki('stream-test-ca'); other = makePki('another-ca');
@@ -212,6 +213,20 @@ describe('the stream against a stub hub over HTTPS', { skip: OPENSSL ? false : '
     await w.stop();
   });
 
+  test('the operator Stop is a valid order; with no run of that agent going it is answered failed with the fixed reason, never done', async () => {
+    assert.equal(validateOrder({ id: 'pca_s0', kind: 'deliver', payload: { agent_id: 'agent-live1', items: [], reason: 'stop' } }).ok, true);
+    reset();
+    const home = freshHome(), w = run(home);
+    assert.ok(await waitFor(() => s.streams.length === 1 && s.plain >= 1));
+    queue = [{ id: 'pca_stop1', kind: 'deliver', payload: { agent_id: 'agent-live1', items: [], reason: 'stop' } }];
+    ping();
+    assert.ok(await waitFor(() => s.results.length === 1), 'the Stop was answered');
+    assert.equal(s.results[0].id, 'pca_stop1');
+    assert.equal(s.results[0].state, 'failed');
+    assert.equal(s.results[0].result.reason, ORDER_REASONS.no_run);
+    await w.stop();
+  });
+
   test('after a dropped stream the worker reconnects, fetches what waited, and loses and repeats nothing', async () => {
     reset();
     const home = freshHome(), w = run(home);
@@ -221,6 +236,45 @@ describe('the stream against a stub hub over HTTPS', { skip: OPENSSL ? false : '
     assert.ok(await waitFor(() => s.opens >= 2 && s.results.length === 1), 'reconnected, and the order made during the gap was fetched');
     await sleep(300);
     assert.equal(s.results.filter((r) => r.id === 'pca_gap1').length, 1);
+    await w.stop();
+  });
+
+  test('a 429 on the stream backs off: the Retry-After the hub sends is obeyed, and without one the wait grows from the base', async () => {
+    reset(); mode = 'ratelimit'; retryAfter = 1;
+    let home = freshHome(), w = run(home, { longPollWait: 1 });
+    assert.ok(await waitFor(() => s.openTimes.length >= 2, 6000), 'it tried again');
+    assert.ok(s.openTimes[1] - s.openTimes[0] >= 950, 'not before the second the hub named (' + (s.openTimes[1] - s.openTimes[0]) + ' ms)');
+    await w.stop();
+    reset(); mode = 'ratelimit';
+    home = freshHome(); w = run(home, { longPollWait: 1 });
+    assert.ok(await waitFor(() => s.openTimes.length >= 3, 6000));
+    const g1 = s.openTimes[1] - s.openTimes[0], g2 = s.openTimes[2] - s.openTimes[1];
+    assert.ok(g1 >= 90 && g2 > g1, 'the wait doubles from the base: ' + g1 + ' then ' + g2 + ' ms');
+    await w.stop();
+  });
+
+  test('after the long poll window the stream is tried again, and orders then come by the stream', async () => {
+    reset(); mode = 'missing';
+    const home = freshHome(), w = run(home, { longPollWait: 1, longPollWindowMs: 700 });
+    assert.ok(await waitFor(() => s.polls >= 1), 'long polling first');
+    const opens = s.opens;
+    mode = 'stream';
+    assert.ok(await waitFor(() => s.streams.length === 1, 8000), 'the stream opened again after the window (' + opens + ' opens before)');
+    queue = [deliver('pca_back1')]; ping();
+    assert.ok(await waitFor(() => s.results.length === 1));
+    await w.stop();
+  });
+
+  test('a disconnect order on the normal poll is refused with the fixed reason: it is fetched with its own credential, never here', async () => {
+    reset();
+    const home = freshHome(), w = run(home);
+    assert.ok(await waitFor(() => s.streams.length === 1 && s.plain >= 1));
+    queue = [{ id: 'pca_dc1', kind: 'disconnect', payload: {} }];
+    ping();
+    assert.ok(await waitFor(() => s.results.length === 1), 'it was answered');
+    assert.equal(s.results[0].id, 'pca_dc1');
+    assert.equal(s.results[0].state, 'failed');
+    assert.equal(s.results[0].result.reason, ORDER_REASONS.disconnect_elsewhere);
     await w.stop();
   });
 

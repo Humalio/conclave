@@ -94,7 +94,7 @@ const appCred = (secret: string): Credential => app.keys.verifyKey(secret, 'app_
 const memberKey = (teamId: string, agentId: string) => app.teams.members(teamId).find((m) => m.agent_id === agentId)!.credential_id;
 const keyId = (secret: string) => /^ah_ses_([a-z2-7]{12})_/.exec(secret)![1]!;
 const credOf = (secret: string) => app.db.prepare('SELECT id FROM credentials WHERE key_id=?').get(keyId(secret)) as { id: string };
-const codeIn = (text: string) => /cnv_enrol_[a-z2-7]{26}/.exec(text)?.[0] ?? null;
+const codeIn = (text: string) => /cnc-pair-[a-z2-7]{26}/.exec(text)?.[0] ?? null;
 const err = (fn: () => unknown): string => { try { fn(); } catch (e) { return (e as { code: string }).code; } return 'ok'; };
 const auditOf = (action: string, id?: string) => app.db.prepare(`SELECT * FROM audit_events WHERE action=?${id ? ' AND target_id=?' : ''}`).all(...(id ? [action, id] : [action])) as { details: string }[];
 /** Pick up and confirm a checkout request with an app key, as setup.mjs restore will. */
@@ -326,7 +326,7 @@ describe('another OS user on the same PC', () => {
     const r = await api('POST', `/checkouts/${id}/render`, { target: 'same_pc_other_user' });
     expect(r.status).toBe(409);
     expect(r.body).toMatchObject({ error: 'invalid_state', reason: 'other_user_pairs_first', message: expect.stringMatching(/That user installs the connector and pairs it.*approve a destination/) });
-    expect(JSON.stringify(r.body)).not.toMatch(/cnv_enrol_/);
+    expect(JSON.stringify(r.body)).not.toMatch(/cnc-pair-/);
     expect(app.db.prepare('SELECT COUNT(*) n FROM credentials').get()).toEqual(keys);
     expect(app.db.prepare('SELECT COUNT(*) n FROM enrolment_codes').get()).toEqual(codes);
     expect(app.checkouts.checkout(id)!.status).toBe('ready');
@@ -354,6 +354,44 @@ describe('other_pc', () => {
     const d = await api('GET', `/checkouts/${id}`);
     expect(d.body.target).toMatchObject({ target: 'other_pc', request: { state: 'collected' } });
   });
+  it('Re-enrol of the connector PC the team moved away from hands over only the keys still there; the moved keys stay active on the target', async () => {
+    const s = await onboarded();
+    const stay = await onboardTeam(s.key); // a second team on the same PC that does not move
+    const t = await targetPc();
+    const id = await ready(s.teamId);
+    const r = await api('POST', `/checkouts/${id}/render`, { target: 'other_pc', machine_id: t.pc });
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    const moved = await collect(t.key, r.body.checkout.request_id);
+    // Every moved agent resumes on the target, so the checkout is restored and closed (the gate is not what this is about).
+    const gate = app.teams.checkoutGate;
+    app.teams.checkoutGate = () => app.teams.mustTeam(s.teamId);
+    try {
+      for (const a of moved) {
+        app.keys.login(appCred(t.key), a.secret);
+        const credId = credOf(a.secret).id;
+        const tok = app.db.prepare('SELECT token_hash FROM session_tokens WHERE session_credential_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1').get(credId) as { token_hash: string };
+        app.checkouts.resume({ agentId: a.agent_id, credId, tokenHash: tok.token_hash, rules: [], cap: [] });
+      }
+    } finally { app.teams.checkoutGate = gate; }
+    expect(app.checkouts.checkout(id)!.status).toBe('restored');
+    // The source PC runs the connector, then its user re-enrols it.
+    const ci = await fetch(`${base}/connector/v1/check-in`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${s.key}` }, body: JSON.stringify({ version: '0.9.6' }) });
+    expect(ci.status).toBe(200);
+    const re = await api('POST', `/pcs/${s.pc}/re-enrol`, {});
+    expect(re.status, JSON.stringify(re.body)).toBe(200);
+    expect(re.body.handover).toBeTruthy();
+    // The handover carries the staying team's agents only.
+    const slots = (app.db.prepare('SELECT agent_id FROM onboarding_slots WHERE request_id=?').all(re.body.handover) as { agent_id: string }[]).map((x) => x.agent_id).sort();
+    expect(slots).toEqual(stay.agents.map((a) => a.id).sort());
+    expect(JSON.parse(auditOf('pc.re_enrol', s.pc).at(-1)!.details)).toMatchObject({ agents_handed_over: stay.agents.length, handover: re.body.handover });
+    // The moved keys are neither handed over nor revoked: they still log in on the target.
+    for (const a of moved) {
+      expect(app.keys.credential(credOf(a.secret).id)).toMatchObject({ status: 'active', bound_machine_id: t.pc });
+      expect(app.keys.login(appCred(t.key), a.secret).token).toMatch(/^ah_tok_/);
+    }
+    // The staying keys work until the PC confirms the handover.
+    for (const a of stay.agents) expect(app.keys.credential(credOf(a.secret).id)!.status).toBe('active');
+  });
   it('a new PC is not rendered for: no PC, key or code is created, and the answer says to add the PC with the connector first', async () => {
     const s = await onboarded();
     const id = await ready(s.teamId);
@@ -362,7 +400,7 @@ describe('other_pc', () => {
     const r = await api('POST', `/checkouts/${id}/render`, { target: 'other_pc', new_pc_name: name });
     expect(r.status).toBe(409);
     expect(r.body).toMatchObject({ error: 'invalid_state', reason: 'add_pc_first', message: expect.stringMatching(/Add this PC with the connector first.*approve a destination/) });
-    expect(JSON.stringify(r.body)).not.toMatch(/cnv_enrol_/);
+    expect(JSON.stringify(r.body)).not.toMatch(/cnc-pair-/);
     expect(app.keys.machines().length).toBe(machines);
     expect(app.db.prepare('SELECT COUNT(*) n FROM credentials').get()).toEqual(keys);
     expect(app.db.prepare('SELECT COUNT(*) n FROM enrolment_codes').get()).toEqual(codes);
@@ -541,7 +579,7 @@ describe('review fixes', () => {
     const view = JSON.stringify((await api('GET', `/checkouts/${id}`)).body);
     for (const text of [audit, choices, view]) {
       for (const x of secrets) expect(text).not.toContain(x);
-      expect(text).not.toMatch(/cnv_enrol_[a-z2-7]{26}|ah_(ses|app)_[a-z2-7]{12}_/);
+      expect(text).not.toMatch(/cnc-pair-[a-z2-7]{26}|ah_(ses|app)_[a-z2-7]{12}_/);
     }
     expect(auditOf('checkout.render_choices', id)).toHaveLength(1);
     expect(JSON.parse(auditOf('checkout.rendered', id)[0]!.details).handout_hashes).toBeTruthy();
@@ -635,7 +673,7 @@ describe('onboarding and checkout review fixes', () => {
   it('the enrol error tells a revoked and an expired code from an unknown one, and an issued code is handed out three times at most', async () => {
     const msg = async (code: string) => (await ob('POST', '/enrol', { body: { code, nonce: nonce() }, from: freshIp() })).body.message as string;
     const add = await api('POST', '/pcs/add', { name: `err-pc-${++seq}` });
-    expect(await msg('cnv_enrol_' + 'a'.repeat(26))).toMatch(/not valid/);
+    expect(await msg('cnc-pair-' + 'a'.repeat(26))).toMatch(/not valid/);
     const rev = await api('POST', '/pcs/add', { name: `err-pc-${++seq}` });
     await api('DELETE', `/pcs/${rev.body.pc.id}/enrolment`);
     expect(await msg(rev.body.code)).toMatch(/revoked/);

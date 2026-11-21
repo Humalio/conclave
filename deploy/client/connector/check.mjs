@@ -19,9 +19,10 @@ import { roleFileProblem } from './role.mjs';
 import { storeName, STORE_LINES } from './keystore.mjs';
 import { isHardened } from './isolation.mjs';
 import { folderApproved } from './approvals.mjs';
+import { codexToolsState } from './codextools.mjs';
 
 /** `{ok, reason, line, steps}`: `steps` lists each check and whether it passed, in the order run. */
-export async function runCheck(home, folderArg, { claudeJson, node, connector, probe = false, win } = {}) {
+export async function runCheck(home, folderArg, { claudeJson, node, connector, probe = false, win, codex = {} } = {}) {
   const steps = [];
   const stop = (reason) => { steps.push({ step: reason, ok: false }); return { ok: false, reason, line: line(reason), steps }; };
   const cf = canonicalFolder(folderArg); if (cf && hasLegacyEntry(cf)) return stop('old_layout');
@@ -43,6 +44,9 @@ export async function runCheck(home, folderArg, { claudeJson, node, connector, p
     const role = roleFileProblem(home, ctx.folder);
     if (role) return stop(role);
     steps.push({ step: 'the Codex role file (AGENTS.override.md) is the one the connector wrote', ok: true });
+    const cx = codexToolsState({ folder: ctx.folder, ...codex });
+    if (cx.state === 'broken') return stop('codex_tools_broken');
+    steps.push({ step: cx.step, ok: true });
   }
   if (probe) {
     // The connector's broker makes the one call (a turn token, revoked at once): no other process signs in with a key.

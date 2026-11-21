@@ -1030,8 +1030,12 @@ describe('code review fixes (10 Nov)', () => {
     const rules1 = app.keys.rules(app.keys.credentials({ kind: 'session_key', agentId: r1.agent_id })[0]!.policy_id, false);
     expect(rules1.some((x) => x.resource === 'path:/vault/HR/Pay/**')).toBe(false);
     expect(rules1.some((x) => x.effect === 'deny' && x.resource === 'path:/vault/HR/**')).toBe(true);
-    // A template inside the coordinator's allow passes, but its deny comes along; one beyond it is refused.
-    const ok = await api('POST', '/templates', { name: `inside${++n}`, rules: [{ effect: 'allow', actions: ['fs.read'], resource: 'path:/vault/**' }] });
+    // A template over a part the coordinator is denied is refused (a member's deny counts against the template).
+    const over = await api('POST', '/templates', { name: `over${++n}`, rules: [{ effect: 'allow', actions: ['fs.read'], resource: 'path:/vault/**' }] });
+    await api('PATCH', `/teams/${X.tid}`, { recruit_template_id: over.body.id });
+    expect((await X.C('team_recruit', recruitArgs(X, 'Over the deny'))).structuredContent.error).toBe('denied');
+    // A template inside the coordinator's allow and outside its deny passes, and its deny still comes along; one beyond it is refused.
+    const ok = await api('POST', '/templates', { name: `inside${++n}`, rules: [{ effect: 'allow', actions: ['fs.read'], resource: 'path:/vault/Proj/**' }] });
     await api('PATCH', `/teams/${X.tid}`, { recruit_template_id: ok.body.id });
     const r2 = (await X.C('team_recruit', recruitArgs(X, 'Templated'))).structuredContent;
     await pickup(r2.pickup);
@@ -1165,7 +1169,7 @@ describe('decisions: agents ask the operator', () => {
     expect(app.teams.task(t.id)).toMatchObject({ status: 'blocked' });
     expect(app.teams.task(t.id)!.blocked_reason).toContain('Run 23e or drop g0?');
     const askedNotice = (await notices(X.C)).find((n) => n.kind === 'decision_asked' && n.body.includes(asked.decision_id));
-    expect(askedNotice?.body).toContain('Read it with team_decisions');
+    expect(askedNotice?.body).toContain(`Read it with team_decisions {decision_id: "${asked.decision_id}"}`);
     expect(askedNotice?.body).not.toContain('Run 23e'); // the question is the agent's words, not a hub notice
     // the console: open questions, counts, and the answer
     expect((await api('GET', '/decisions/counts')).body.by_team[X.tid]).toBe(1);
@@ -1178,8 +1182,16 @@ describe('decisions: agents ask the operator', () => {
     expect(app.teams.task(t.id)).toMatchObject({ status: 'in_progress', assignee_agent_id: X.w1.id, blocked_reason: null, blocked_from: null });
     const n = await notices(X.W1);
     expect(n.some((x) => x.kind === 'decision' && x.body.includes('Run 23e') && x.body.includes('back in progress with you'))).toBe(true);
-    const log = (await X.W1('team_decisions', { team_id: X.tid })).structuredContent.decisions;
+    const log = (await X.W1('team_decisions', { team_id: X.tid, status: 'all' })).structuredContent.decisions;
     expect(log[0]).toMatchObject({ decision_id: asked.decision_id, status: 'answered', answer: 'Run 23e', answer_text: 'Keep g0; the claim needs it.' });
+    // By default only what still waits; decision_id gives that one question, answered or not.
+    const waiting = await X.W1('team_decisions', { team_id: X.tid });
+    expect(waiting.structuredContent.decisions).toEqual([]);
+    expect(waiting.content[0]!.text).toContain('No open decisions');
+    const one = (await X.W1('team_decisions', { team_id: X.tid, decision_id: asked.decision_id })).structuredContent.decisions;
+    expect(one).toHaveLength(1);
+    expect(one[0]).toMatchObject({ decision_id: asked.decision_id, status: 'answered' });
+    expect((await X.W1('team_decisions', { team_id: X.tid, decision_id: 'dec_nope' })).isError).toBeTruthy();
     // the vault note got the entry
     const note = readFileSync(join(app.config.vaultDir, 'Decisions log.md'), 'utf8');
     expect(note).toContain('Run 23e or drop g0?');

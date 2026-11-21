@@ -48,7 +48,7 @@ export class ClientFiles {
 
 const STATUS: Record<string, number> = {
   invalid_argument: 400, contains_key: 400, unauthorized: 401, invalid_pairing_code: 401, capability_off: 403, suspended: 403, not_found: 404, denied: 404,
-  conflict: 409, invalid_state: 409, checkout_open: 409, handout_changed: 409, scan_pending: 409, lockdown: 423, upgrade_required: 426, rate_limited: 429,
+  conflict: 409, invalid_state: 409, invite_refused: 409, checkout_open: 409, handout_changed: 409, scan_pending: 409, lockdown: 423, upgrade_required: 426, rate_limited: 429,
 };
 
 const isLoopback = (ip: string) => ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip.startsWith('127.');
@@ -111,10 +111,13 @@ export function registerOnboarding(f: FastifyInstance, ob: Onboarding, files: Cl
   // Through a registered relay (its secret was verified for this request) the hub the PC pins is the relay: its origin and its CA.
   const pinned = (req: FastifyRequest) => req.relay ? { ...ob.hubInfo(), origin: req.relay.origin, caSha256: req.relay.ca_sha256 } : { ...ob.hubInfo(), caSha256: files.ca()?.sha256 ?? null };
   route('get', '/connector/v1/hub', (req) => { const h = pinned(req); return { hub_id: h.id, origin: h.origin }; });
-  route('post', '/connector/v1/pair', (req) => { const b = obj(req.body); return ob.pair(b.pairing_code, { origin: b.hub_origin, caSha256: b.hub_ca_sha256 }, pinned(req), req.ip); });
+  route('post', '/connector/v1/pair', (req) => { const b = obj(req.body); return ob.pair(b.pairing_code, { origin: b.hub_origin, caSha256: b.hub_ca_sha256 }, pinned(req), req.ip, { version: b.version, platform: b.platform }); });
 
   // ── requests (the PC key) ──
   route('post', '/onboard/requests', (req) => ob.file(ob.authApp(bearer(req), req.ip), req.body));
+  // After pairing (app key): what the agent may ask about, and an invite's pre-approved join (docs/onboarding.md#the-prompt).
+  route('get', '/onboard/choices', (req) => ob.choices(ob.authApp(bearer(req), req.ip)));
+  route('post', '/onboard/invites/:id/redeem', (req) => ob.redeemInvite(ob.authApp(bearer(req), req.ip), (req.params as { id: string }).id, req.ip));
   route('get', '/onboard/requests', (req) => ({ requests: ob.pending(ob.authApp(bearer(req), req.ip)) }));
   route('get', '/onboard/requests/:id', async (req) => {
     const app = ob.authApp(bearer(req), req.ip);

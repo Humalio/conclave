@@ -629,6 +629,8 @@ export class Hardware {
   // ───── Agents ─────
 
   /** The machines an agent may use: offered to a team it is a live member of, on an active PC. */
+  /** Whether any machine is offered to one of the agent's teams: the hw_* tools are listed only then (docs/mcp.md). */
+  offers(agentId: string): boolean { return this.offered(agentId).length > 0; }
   private offered(agentId: string): { id: string; name: string }[] {
     return this.db.prepare(`SELECT DISTINCT m.id, m.name FROM hw_machines h JOIN machines m ON m.id=h.machine_id
       JOIN hw_machine_teams s ON s.machine_id=h.machine_id JOIN team_members tm ON tm.team_id=s.team_id AND tm.agent_id=? AND tm.removed_at IS NULL

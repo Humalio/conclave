@@ -72,7 +72,8 @@ export function post(hub, body, headers, timeoutMs) {
             }
           }
         } catch { return fail({ message: 'the hub sent a reply that is not JSON', reason: 'hub_unreachable' }); }
-        res({ status: 200, messages, sessionId: r.headers['mcp-session-id'] ?? null, body: null });
+        // x-agent-hub-tools: the digest of the tools this session lists (docs/mcp.md, "When the list changes").
+        res({ status: 200, messages, sessionId: r.headers['mcp-session-id'] ?? null, body: null, tools: typeof r.headers['x-agent-hub-tools'] === 'string' ? r.headers['x-agent-hub-tools'] : null });
       });
     });
     req.on('timeout', () => req.destroy(Object.assign(new Error(`no answer within ${Math.round(timeoutMs / 1000)} s`), { code: 'ETIMEDOUT' })));

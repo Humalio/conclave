@@ -123,7 +123,7 @@ describe('client files and the prompt', () => {
   });
   it('Add PC and Re-enrol return the code but no legacy prompt, and say why there is no connector prompt; the code is stored only as a verifier', async () => {
     const add = await api('POST', '/pcs/add', { name: 'prompt-pc' });
-    expect(add.body.code).toMatch(/^cnv_enrol_[a-z2-7]{26}$/);
+    expect(add.body.code).toMatch(/^cnc-pair-[a-z2-7]{26}$/);
     expect(add.body).not.toHaveProperty('prompt');
     // This hub serves no CA certificate, so nothing can be pinned: no pairing, no connector prompt, and the reason.
     expect(add.body).toMatchObject({ pairing: null, connector_prompt: null, connector_unavailable: 'no_ca' });
@@ -164,8 +164,8 @@ describe('enrolment code', () => {
   });
   it('locks an address out after 10 failed codes and alerts', async () => {
     const from = freshIp();
-    for (let i = 0; i < 10; i++) expect((await ob('POST', '/enrol', { body: { code: 'cnv_enrol_aaaaaaaaaaaaaaaaaaaaaaaaaa', nonce: nonce() }, from })).status).toBe(401);
-    const r = await ob('POST', '/enrol', { body: { code: 'cnv_enrol_aaaaaaaaaaaaaaaaaaaaaaaaaa', nonce: nonce() }, from });
+    for (let i = 0; i < 10; i++) expect((await ob('POST', '/enrol', { body: { code: 'cnc-pair-aaaaaaaaaaaaaaaaaaaaaaaaaa', nonce: nonce() }, from })).status).toBe(401);
+    const r = await ob('POST', '/enrol', { body: { code: 'cnc-pair-aaaaaaaaaaaaaaaaaaaaaaaaaa', nonce: nonce() }, from });
     expect(r.status).toBe(429);
     expect(r.body.retry_after_s).toBeGreaterThan(0);
     expect(alerts('enrol_fail').some((x) => x.subject === from)).toBe(true);
@@ -668,11 +668,12 @@ describe('docs consistency', () => {
     expect(copy).toContain("for (const f of ['restore-prompt.md'])");
     expect(copy).not.toMatch(/agent-hub-headers|setup\.mjs|onboarding-prompt/);
   });
-  it('the LAN plain-HTTP site proxies the onboarding downloads and nothing else of onboarding', () => {
+  it('the LAN plain-HTTP site proxies only the CA certificate of onboarding, and the relay no client files', () => {
     const cf = readFileSync(join(process.cwd(), '..', 'deploy', 'caddy', 'lan.Caddyfile'), 'utf8');
     const http = cf.slice(cf.indexOf('http://:'));
     const paths = [...http.matchAll(/^\s*@\w+ path (.+)$/gm)].flatMap((m) => m[1]!.trim().split(/\s+/)).filter((x) => x.startsWith('/onboard'));
-    expect(paths.sort()).toEqual(['/onboard/ca.crt', '/onboard/client/*']);
+    expect(paths.sort()).toEqual(['/onboard/ca.crt']);
+    expect(readFileSync(join(process.cwd(), '..', 'deploy', 'relay', 'relay.Caddyfile'), 'utf8')).not.toContain('/onboard/client');
     expect(http).toMatch(/@onboard_files path [^\n]+\n\s*handle @onboard_files \{\s*reverse_proxy agent-hub:8080/);
     // Everything else still falls through to the redirect to HTTPS.
     expect(http).toMatch(/handle \{\s*redir https:/);

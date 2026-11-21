@@ -12,7 +12,7 @@ import type { Db } from '../db/db.js';
 import type { Hardware } from '../hardware/hardware.js';
 import { SAMPLE_MAX } from '../hardware/hardware.js';
 import { LONG_POLL_MAX_S } from './stream.js';
-import { Connector, CLIENTS, DELIVER_REASONS, WAKE_STATES, ISOLATION, KEY_STORES, DESTINATION_RE, PC_REPORTED, RESET_RESULT_CODES, VERSION_RE } from './connector.js';
+import { Connector, CLIENTS, DELIVER_REASONS, WAKE_STATES, ISOLATION, LEFTOVER_KIND_WORDS, KEY_STORES, DESTINATION_RE, PC_REPORTED, RESET_RESULT_CODES, VERSION_RE } from './connector.js';
 
 const STATUS: Record<string, number> = { invalid_argument: 400, contains_key: 400, forbidden: 403, not_found: 404, conflict: 409, invalid_state: 409, lockdown: 423 };
 const version = z.string().max(40).regex(VERSION_RE);
@@ -34,6 +34,8 @@ const CheckInBody = z.object({
   isolation: z.enum(ISOLATION).nullable().optional(), key_store: z.enum(KEY_STORES).nullable().optional(),
   // Only a yes or no: the PC never says which pieces or where.
   legacy_leftovers: z.boolean().nullable().optional(),
+  // Which kinds, as fixed words: still no path or name.
+  legacy_leftover_kinds: z.array(z.enum(LEFTOVER_KIND_WORDS)).max(4).nullable().optional(),
   agents: z.array(z.object({ agent_id: z.string().max(100), state: z.enum(PC_REPORTED), profile: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9 _-]{0,39}$/).optional(), profile_hidden: z.literal(true).optional() }).strict()).max(200).optional(),
   // Restore destinations the PC's user approved: an id and a plain label, never a path.
   destinations: z.array(z.object({ id: z.string().regex(DESTINATION_RE), label: z.string().min(1).max(80) }).strict()).max(20)
@@ -183,7 +185,7 @@ export function registerConnector(f: FastifyInstance, db: Db, connector: Connect
   f.post('/connector/v1/folders-allowed-with-pickup', withPc((pc, req) => connector.foldersAllowedWithPickup(pc, z.object({ allowed: z.array(z.object({ agent_id: z.string().max(100), ref: z.string().max(100) }).strict()).max(100) }).strict().parse(req.body ?? {}).allowed)));
   f.post('/connector/v1/folders-grandfathered', withPc((pc, req) => connector.foldersGrandfathered(pc, z.object({ agents: z.array(z.string().max(100)).max(200) }).strict().parse(req.body ?? {}).agents)));
   // The agent folders the connector registered: each becomes a proposed folder row, for the operator to approve (docs/connector.md, "Folders").
-  f.post('/connector/v1/folders', withPc((pc, req) => connector.proposeFolders(pc, z.object({ folders: z.array(z.object({ agent: z.string().max(100), path: z.string().max(600) }).strict()).max(200) }).strict().parse(req.body ?? {}).folders)));
+  f.post('/connector/v1/folders', withPc((pc, req) => connector.proposeFolders(pc, z.object({ folders: z.array(z.object({ agent: z.string().max(100), agent_id: z.string().max(100).optional(), path: z.string().max(600) }).strict()).max(200) }).strict().parse(req.body ?? {}).folders)));
   // The wake: a run's state (a heartbeat rides on it) and the completion check after it (docs/connector.md, "The wake").
   const wakeId = z.string().regex(/^[A-Za-z0-9_-]{1,100}$/);
   f.post('/connector/v1/wake/report', withPc((pc, req) => connector.wakeReport(pc, z.object({ agent_id: wakeId, state: z.enum(WAKE_STATES), run: wakeId.optional(), task: wakeId.optional(), session_id: z.string().regex(/^[A-Za-z0-9_.:-]{1,100}$/).optional(), last_activity: count.optional(), resumes_at: count.optional(), waiting_on: wakeId.optional() }).strict().parse(req.body ?? {}))));

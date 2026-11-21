@@ -483,6 +483,13 @@ describe('keep off and apply again: exempt, unexempt and the notices that settle
     retire(cite, short);
   });
 
+  it('one-click adopt with no text uses the report summary when the agent sent no full text', () => {
+    const W = world();
+    const rep = app.directives.report(W.w.id, { title: 'Summary only rule', summary: 'Say agent, not a product name.' });
+    const d = app.directives.adopt(rep.id, {}, admin).directive;
+    expect(d.body).toBe('Say agent, not a product name.');
+    retire(d);
+  });
   it('merge and adopt notices settle when the agent confirms the directive they point to', () => {
     const W = world();
     const a = dir('Merge settle A', { kind: 'agent', ref: W.c.id }), b = dir('Merge settle B', { kind: 'agent', ref: W.c.id });

@@ -6,6 +6,12 @@
  * the GitHub Releases page with the release. A copy without them refuses to run.
  *
  *   node conclave-install-<version>.mjs [--from <folder>] [--no-service] [--no-screen] [--no-browser]
+ *   echo <code> | node conclave-install-<version>.mjs --pair - --hub <origin> --ca <fingerprint> [--from <folder>]
+ *
+ * `--pair -` pairs the PC with the hub with no screen and no click (docs/onboarding.md, "The prompt"). The one-time pairing code
+ * is read from standard input only, never from an argument (an argument is refused, and so is a terminal with nothing piped in),
+ * so it is not in the installer's own command line. (A hand-typed echo still reaches the shell history, and a wrapper such as bash -c holds it in its arguments for a few seconds; the code is single use and spent at pairing.) The installed connector checks the hub's CA against `--ca` and the
+ * origin against `--hub` before it sends the code (a mismatch stops with nothing sent), pairs, and only then starts the service.
  *
  * It checks the release before anything of it runs, with no hub involved: the manifest's Ed25519 signature against the
  * keys it carries, that the manifest is for exactly its version and this platform, and that the bundle's size, hash and
@@ -43,6 +49,11 @@ const LINES = {
   downgrade: 'A newer connector is already installed on this PC. Nothing was changed.',
   missing: 'The release files are missing. Nothing was installed.',
   old_node: 'The connector needs Node.js 18 or later. Install it, then run this installer again.',
+  code_argument: 'The pairing code is never given as an argument: it would show in the process list. Use --pair - and send the code on standard input, for example: echo <code> | node <this file> --pair - --hub <origin> --ca <fingerprint>',
+  pair_needs: '--pair - needs --hub <origin> and --ca <fingerprint>.',
+  no_code: 'No pairing code came on standard input. Send it on standard input, for example: echo <code> | node <this file> --pair - --hub <origin> --ca <fingerprint>',
+  invite_failed: 'The connector is paired, but the invite was refused or could not be redeemed; the line above says why.',
+  pair_failed: 'The connector is installed but this PC is not paired; the line above says why. Nothing else was started.',
 };
 
 const sha256 = (b) => createHash('sha256').update(b).digest('hex');
@@ -125,7 +136,7 @@ async function readRelease(embed, from) {
 }
 
 /** The whole install. Answers `{ok, reason?, version, keyId, home}`; prints one line per step, never a secret (there is none). */
-export async function install({ embed = EMBED, from, home, service = true, screen = true, browser = true, out = (s) => process.stdout.write(s + '\n') } = {}) {
+export async function install({ embed = EMBED, from, home, service = true, screen = true, browser = true, pair = null, out = (s) => process.stdout.write(s + '\n') } = {}) {
   if (Number(process.versions.node.split('.')[0]) < 18) return { ok: false, reason: 'old_node' };
   if (!embed) return { ok: false, reason: 'not_built' };
   const rel = await readRelease(embed, from);
@@ -150,6 +161,25 @@ export async function install({ embed = EMBED, from, home, service = true, scree
   if (['keys.env', 'setup.mjs'].some((n) => existsSync(join(home, n)))) out('This PC still has the old setup. Run `conclave migrate` (then `conclave migrate --apply`) before you rely on the service: until the move it has no hub and stops by itself.');
   const launcher = join(home, 'conclave.mjs');
   const env = { ...process.env, CONCLAVE_HOME: home };
+  // Pairing comes before the service, so the service starts with its hub. The code goes to the child on standard input and nowhere else.
+  if (pair) {
+    const r = spawnSync(process.execPath, [launcher, 'pair', '--hub', pair.hub, '--check', pair.ca], { env, input: String(pair.code), encoding: 'utf8' });
+    for (const l of `${r.stdout ?? ''}${r.stderr ?? ''}`.split(/\r?\n/)) if (l.trim()) out(l);
+    if (r.status !== 0) return { ok: false, reason: 'pair_failed', pairStatus: r.status ?? 1, version: c.manifest.version, home };
+    screen = false;
+    // A collaborator's invite: redeem it now, then pick up the keys and build the folder. The agent that runs the installer waits for the line below.
+    const hubId = /^hub: ([A-Za-z0-9_-]+)$/m.exec(String(r.stdout ?? ''))?.[1];
+    const hubArgs = hubId ? ['--hub', hubId] : [];
+    const inv = /^code_kind: invite ([A-Za-z0-9_-]+)$/m.exec(String(r.stdout ?? ''));
+    if (inv) {
+      const red = spawnSync(process.execPath, [launcher, 'setup', 'redeem', inv[1], ...hubArgs], { env, encoding: 'utf8' });
+      for (const l of `${red.stdout ?? ''}${red.stderr ?? ''}`.split(/\r?\n/)) if (l.trim()) out(l);
+      if (red.status !== 0) return { ok: false, reason: 'invite_failed', pairStatus: 1, version: c.manifest.version, home };
+      const go = spawnSync(process.execPath, [launcher, 'setup', 'continue', '--wait', '30', ...hubArgs], { env, encoding: 'utf8' });
+      for (const l of `${go.stdout ?? ''}${go.stderr ?? ''}`.split(/\r?\n/)) if (l.trim()) out(l);
+      out(go.status === 0 ? 'This PC joined the team from an invite.' : 'This PC redeemed the invite but is not set up yet. Run conclave setup continue --wait 30 to finish.');
+    }
+  }
   if (service) {
     const s = spawnSync(process.execPath, [launcher, 'service', 'install'], { env, stdio: 'inherit' });
     if (s.status !== 0) out('The logon service could not be installed; run `conclave service install` later. The connector works without it until then.');
@@ -167,6 +197,19 @@ if (isMain) {
   const fromAt = argv.indexOf('--from');
   const from = fromAt >= 0 ? resolve(argv[fromAt + 1] ?? '.') : undefined;
   const home = process.env.CONCLAVE_HOME ? resolve(process.env.CONCLAVE_HOME) : join(homedir(), '.config', 'conclave');
-  const r = await install({ from, home, service: !has('--no-service'), screen: !has('--no-screen'), browser: !has('--no-browser') });
-  if (!r.ok) { process.stderr.write(`conclave installer: ${LINES[r.reason] ?? r.reason}\n`); process.exit(1); }
+  const val = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : undefined; };
+  let pair = null;
+  if (has('--pair')) {
+    const fail = (reason) => { process.stderr.write(`conclave installer: ${LINES[reason]}\n`); process.exit(2); };
+    if (val('--pair') !== '-') fail('code_argument');
+    if (!val('--hub') || !val('--ca')) fail('pair_needs');
+    let code = '';
+    if (!process.stdin.isTTY) { for await (const c of process.stdin) { code += c; if (code.length > 200) break; } }
+    code = code.trim();
+    if (!code) fail('no_code');
+    pair = { hub: val('--hub'), ca: val('--ca'), code };
+  }
+  const r = await install({ from, home, service: !has('--no-service'), screen: !has('--no-screen'), browser: !has('--no-browser'), pair });
+  // Exit 3: the hub's CA or origin did not match (nothing was sent); 4: the code was refused or the hub could not be reached; 5: paired, but the invite was refused.
+  if (!r.ok) { process.stderr.write(`conclave installer: ${LINES[r.reason] ?? r.reason}\n`); process.exit(r.reason === 'pair_failed' ? (r.pairStatus === 3 ? 3 : 4) : r.reason === 'invite_failed' ? 5 : 1); }
 }

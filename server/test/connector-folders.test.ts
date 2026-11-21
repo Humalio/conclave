@@ -86,6 +86,17 @@ describe('a folder the connector sends', () => {
     expect(r.body.refused).toHaveLength(5);
     expect(rows(w.pc)).toEqual([{ path: good, status: 'proposed' }]);
   });
+  it('is matched by the agent id, or by the folder slug of its label (what the connector knows), not only by the label', async () => {
+    const w = await world('fold-slug', 'Auto coordinator');
+    const id = (app.db.prepare('SELECT id FROM agents WHERE label=?').get('Auto coordinator') as { id: string }).id;
+    const r = await send(w, [
+      { agent: 'auto-coordinator', path: 'C:\\Users\\b\\Slug' },
+      { agent: 'auto-coordinator-2', agent_id: id, path: 'C:\\Users\\b\\ById' },
+      { agent: 'nobody', agent_id: 'agent-notmine', path: 'C:\\Users\\b\\Nobody' },
+    ]);
+    expect(r.body).toMatchObject({ proposed: 2 });
+    expect(r.body.refused.map((x: { reason: string }) => x.reason)).toEqual(['unknown_agent']);
+  });
   it('is refused for an agent of another PC', async () => {
     const w = await world('fold-own', 'own agent'), other = await world('fold-foreign', 'foreign agent');
     expect((await send(w, [{ agent: other.label, path: 'C:\\Users\\b\\Foreign' }])).body.proposed).toBe(0);

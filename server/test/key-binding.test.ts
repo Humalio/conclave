@@ -103,6 +103,14 @@ describe('PC binding of session keys', () => {
     expect((await login(appB, k.secret)).isError).toBeFalsy();
   });
 
+  it('a session that signs in by header gets tool schemas without session_token', async () => {
+    const k = newKey('schema');
+    const tok = (await login(appA, k.secret)).structuredContent.session_token as string;
+    const props = async (c: Client) => Object.keys(((await c.listTools()).tools.find((t) => t.name === 'session_whoami')!.inputSchema.properties ?? {}) as object);
+    expect(await props(await client(appA, { 'X-Agent-Hub-Session': tok }))).not.toContain('session_token');
+    expect(await props(await client(appA))).toContain('session_token');
+  });
+
   it('rotation keeps the binding; app keys and unknown PCs are refused', async () => {
     const k = newKey('rot');
     app.keys.setBinding(k.credential.id, pcA, sys);

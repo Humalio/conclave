@@ -69,7 +69,7 @@ export interface TaskAttachHook {
   /** Why the upload may not go on (each chunk, and again as it lands), or null. */
   refusal(c: Uploader & { target: string }): { reason: string; message: string } | null;
   /** The files, complete and scanned: write the set's next version. Throws a KeyError when a check or limit refuses them. */
-  commit(c: ChannelRow, files: { path: string; bytes: Buffer }[]): Promise<{ task_id: string; role: string; share_id: string; version: number; files: number; total_bytes: number }>;
+  commit(c: ChannelRow, files: { path: string; bytes: Buffer }[]): Promise<{ task_id: string; role: string; share_id: string; version: number; files: number; total_bytes: number; received?: { name: string; size: number; sha256: string }[] }>;
   /** The most one upload may carry, and one file. */
   maxBytes: number; fileMax: number;
 }
@@ -401,9 +401,26 @@ export class Channels {
     if (this.lockdown?.blocks('file_update', c.from_agent_id, c.from_machine_id)) return 'lockdown';
     return this.saveRefusal(c, (c.base_revision ?? 'absent') === 'absent' ? 'fs.create' : 'fs.update', `path:${this.vault.normalise(c.target).path}`);
   }
+  /** May the receiving agent still accept channels from this sender (its keys, grants and team links); set by app.ts from Messaging. */
+  peerAllows: ((agentId: string, action: string, resource: string) => boolean) | null = null;
+  /**
+   * An agent-to-agent channel keeps relaying only while the grants that opened it hold: the sender still has channel.use and
+   * channel.open on the receiver, and the receiver still has channel.use and channel.accept for the sender (a revoked grant or
+   * a removed team link stops it at the next chunk, as a revoked key does). Other channels are decided on their own rules.
+   */
+  private agentGrantsHold(c: ChannelRow): boolean {
+    if (c.target_kind !== 'agent' || !c.to_agent_id) return true;
+    const appId = c.from_app_credential_id;
+    const rules = this.keys.rulesFor(c.from_credential_id), appCap = appId ? this.keys.rulesFor(appId) : [];
+    const cap = this.ownerScope ? this.ownerScope.cap(c.from_agent_id, appCap) : appCap;
+    const may = (action: string, res: string) => authorize(rules, cap, action, res, { isPaused: this.teams.isPaused }).allowed;
+    if (!may('channel.use', 'channel:any') || !may('channel.open', `agent:${c.to_agent_id}`)) return false;
+    if (!this.peerAllows) return true;
+    return this.peerAllows(c.to_agent_id, 'channel.use', 'channel:any') && this.peerAllows(c.to_agent_id, 'channel.accept', `agent:${c.from_agent_id}`);
+  }
   private bridgeParticipantsActive(c: ChannelRow): boolean {
     return this.credActive(c.from_credential_id) &&
-      (c.to_credential_id === null || this.credActive(c.to_credential_id));
+      (c.to_credential_id === null || this.credActive(c.to_credential_id)) && this.agentGrantsHold(c);
   }
   private leak(c: ChannelRow, text: string, field: string): boolean {
     const hit = this.guard.scanString(text, field);
@@ -428,7 +445,7 @@ export class Channels {
     if (c.mode !== 'inline' || c.from_agent_id !== agentId || c.direction !== 'send') throw err('invalid_state', 'channel_send is for the sender of an inline channel.');
     if (c.status === 'offered') throw err('invalid_state', 'The receiver has not accepted this channel yet.');
     if (c.status !== 'open') return { ok: false, status: c.status, ...reasonOut(c.failure_reason), result: c.result ? JSON.parse(c.result) : null };
-    if (!this.credActive(c.from_credential_id)) { this.fail(id, 'denied'); throw err('denied', DENIED); }
+    if (!this.credActive(c.from_credential_id) || !this.agentGrantsHold(c)) { this.fail(id, 'denied'); throw err('denied', DENIED); }
     const refused = this.uploadRefusal(c);
     if (refused) { this.fail(id, refused); throw err(refused, refused === 'paused' ? PAUSED : DENIED); }
     this.touch(id);
@@ -467,7 +484,7 @@ export class Channels {
     for (;;) {
       const c = this.get(id)!;
       if (c.status === 'offered') throw err('invalid_state', 'Accept the channel first.');
-      if (c.status === 'open' && !this.downloadAllowed(c)) { this.fail(id, 'denied'); continue; }
+      if (c.status === 'open' && (!this.downloadAllowed(c) || !this.agentGrantsHold(c))) { this.fail(id, 'denied'); continue; }
       const r = this.relay(id);
       if (c.status === 'open' && r.queue.length > 0) {
         const out: { seq: number; data: string }[] = [];
@@ -571,7 +588,7 @@ export class Channels {
       if (c.direction === 'send' && c.from_machine_id === machineId && !c.sender_done) {
         const paths = c.from_local_path?.startsWith('[') ? JSON.parse(c.from_local_path) as string[] : null;
         const agent = (this.db.prepare('SELECT label FROM agents WHERE id=?').get(c.from_agent_id) as { label: string | null } | undefined)?.label ?? undefined;
-        jobs.push({ id: `${c.id}:send`, kind: 'send', channel_id: c.id, framing: c.framing, target: c.target_kind, ...(paths ? { local_paths: paths } : { local_path: c.from_local_path! }), ...(agent ? { agent } : {}) });
+        jobs.push({ id: `${c.id}:send`, kind: 'send', channel_id: c.id, framing: c.framing, target: c.target_kind, ...(paths ? { local_paths: paths } : { local_path: c.from_local_path! }), ...(agent ? { agent } : {}), agent_id: c.from_agent_id });
       }
       const recvMachine = c.direction === 'download' ? c.from_machine_id : c.to_machine_id;
       // Verification and publication are separate. A bridge may restart between them.

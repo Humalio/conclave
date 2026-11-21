@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
+import { PublicLimiter, publicBucket, limitAddress } from './util/publicLimit.js';
 import { ZodError } from 'zod';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Config } from './config.js';
@@ -15,7 +16,7 @@ import { LeakGuard } from './guard/leakGuard.js';
 import { Vault, VaultError } from './vault/vault.js';
 import { VaultStore, MAX_CONTENT } from './vault/store.js';
 import { builtinTemplates } from './policy/catalogue.js';
-import { buildMcpServer, removedToolAnswer, compactHeader, clientHint } from './mcp/tools.js';
+import { buildMcpServer, removedToolAnswer, compactHeader, clientHint, toolsDigest } from './mcp/tools.js';
 import { Setup } from './setup/setup.js';
 import { Links } from './links/links.js';
 import { OwnerScope } from './policy/ownerScope.js';
@@ -38,6 +39,7 @@ import { Access } from './access/access.js';
 import { Lockdown } from './safety/lockdown.js';
 import { Alerts, DEFAULT_ALERT_OPTS } from './safety/alerts.js';
 import { Maintenance, DEFAULT_RETENTION } from './safety/retention.js';
+import { DbHealth } from './safety/dbHealth.js';
 import { Graph } from './graph/graph.js';
 import { Feedback } from './feedback/feedback.js';
 import { Hardware } from './hardware/hardware.js';
@@ -47,7 +49,8 @@ import { bootstrapAdmin, registerAdminApi } from './admin/api.js';
 import { Users } from './admin/users.js';
 import { Routing } from './admin/routing.js';
 import { loadBlueprintLimits } from './admin/blueprintApi.js';
-import { Onboarding, OnboardError } from './onboarding/onboarding.js';
+import { Onboarding, OnboardError, CODE_PREFIX } from './onboarding/onboarding.js';
+import { hmacHex } from './util/crypto.js';
 import { Checkouts } from './checkout/checkout.js';
 import { CheckoutKeys } from './checkout/render.js';
 import { Mirror } from './mirror/mirror.js';
@@ -89,7 +92,8 @@ export async function buildApp(config: Config, extras: { demo?: import('./demo/d
   vault.agentSkip = [[MIRROR_FOLDER]];
   store.start({ scanSeconds: config.vaultScanSeconds ?? 60, watch: config.vaultWatch !== false });
   const relays = new Relays(db, config.pepper, audit);
-  const guard = new LeakGuard({ isIssued: (k, id, s) => (k === 'rly' ? relays.isIssued(id, s) : keys.isIssued(k, id, s)) });
+  // A pairing code counts as issued when it is one of the hub's own codes, used or not (docs/onboarding.md#the-code).
+  const guard = new LeakGuard({ isIssued: (k, id, s) => (k === 'rly' ? relays.isIssued(id, s) : k === 'pair' ? !!db.prepare('SELECT 1 x FROM enrolment_codes WHERE verifier=?').get(hmacHex(config.pepper, `${CODE_PREFIX}${s}`)) : keys.isIssued(k, id, s)) });
   const loginLimit = new RateLimit(db, 10, 10 * 60 * 1000);
   const setup = new Setup(db, config.pepper, audit, keys, config.publicUrl, config.bridgeFile);
   const links = new Links(db, keys, audit);
@@ -166,6 +170,7 @@ export async function buildApp(config: Config, extras: { demo?: import('./demo/d
     bytesPerHour: config.channelBytesPerHour ?? 50 * 1024 ** 3, bufferBytes: config.channelBufferBytes ?? 8 * 1024 * 1024, tmpDir: join(config.dataDir, 'tmp'), expireMs: 10 * 60_000, idleMs: config.channelIdleMs ?? 2 * 3600_000,
   });
   channels.ownerScope = ownerScope;
+  channels.peerAllows = (agentId, action, resource) => messaging.agentAllows(agentId, action, resource);
   // The connector's service carries an enrolled PC's transfers; task files from the PC land through TaskAttachments (docs/transfers.md).
   channels.connectorPc = (pc) => ['online', 'offline'].includes(connector.status(pc).status);
   channels.taskAttach = { refusal: (c) => taskAttachments.uploadRefusal(c), commit: (c, files) => taskAttachments.commitUpload(c, files), maxBytes: ATTACH_LIMITS.version, fileMax: ATTACH_LIMITS.file };
@@ -235,6 +240,7 @@ export async function buildApp(config: Config, extras: { demo?: import('./demo/d
   const graph = new Graph(db, store, vault, teams, keys, config.graph, audit);
   const alerts = new Alerts(db, audit, keys, vault, config.alerts ? { ...DEFAULT_ALERT_OPTS, ...config.alerts } : DEFAULT_ALERT_OPTS);
   const maintenance = new Maintenance(db, store, access, alerts, config.retention ? { ...DEFAULT_RETENTION, ...config.retention } : DEFAULT_RETENTION);
+  maintenance.health = new DbHealth({ db, audit, keys, lockdown, dbFile: config.dbFile, backupDir: config.backupDir ?? join(config.dataDir, 'backups'), retention: config.retention ? { ...DEFAULT_RETENTION, ...config.retention } : DEFAULT_RETENTION });
   if (config.maintenanceSeconds !== 0) maintenance.start((config.maintenanceSeconds ?? 60) * 1000);
   const upkeep = setInterval(() => { try { teams.tick(true); channels.sweep(); users.sweepExpired(); routing.escalate(); hardware.sweepAll(); handovers.sweep(); taskAttachments.sweep(); connector.tick(); } catch (e) { fastify.log.error(e); } }, 30_000);
   upkeep.unref();
@@ -284,6 +290,17 @@ export async function buildApp(config: Config, extras: { demo?: import('./demo/d
     const ip = typeof c === 'string' ? clientAddress(c) : null;
     if (ip) Object.defineProperty(req, 'ip', { value: ip, configurable: true });
     relays.touch(relay.id, ip ?? req.ip);
+  });
+
+  // A general limit on the public routes, per address (after the relay hook above has set the user's address): 429 with Retry-After.
+  const publicLimiter = new PublicLimiter({ max: config.publicRequestsPerMinute ?? 300 });
+  fastify.addHook('onRequest', async (req, reply) => {
+    const bucket = publicBucket(req.url, req.headers);
+    if (!bucket) return;
+    // The client address counts only when TRUST_PROXY is set (or a registered relay vouched for it); else the connection's own address.
+    const r = publicLimiter.hit(limitAddress(req, config.trustProxy), Date.now(), bucket);
+    if (!r.limited) return;
+    return reply.code(429).header('retry-after', String(r.retryAfterSeconds)).send({ error: 'rate_limited', message: `Too many requests from this address. Try again in ${r.retryAfterSeconds} seconds.` });
   });
 
   fastify.addHook('onSend', async (req, reply, payload) => {
@@ -402,6 +419,9 @@ export async function buildApp(config: Config, extras: { demo?: import('./demo/d
     const server = buildMcpServer({ db, keys, audit, guard, vault, store, loginLimit, setup, links, messaging, teams, messagesPerHour: config.messagesPerHour ?? 120, shares, channels, access, lockdown, alerts, graph, feedback, hardware, decisions, directives, blueprint, checkouts, ownerScope, attachments: taskAttachments }, app, req.ip, headerToken, headerSession, compactHeader(req.headers['x-agent-hub-compact']), clientHint(req.headers['x-agent-hub-folder'], req.headers['x-agent-hub-session-var']));
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     reply.hijack();
+    // The digest of what this session lists (docs/mcp.md, "When the list changes"): conclave mcp compares it to tell the client.
+    const digest = toolsDigest(server);
+    if (digest) reply.raw.setHeader('x-agent-hub-tools', digest);
     reply.raw.on('close', () => { void transport.close(); void server.close(); });
     await server.connect(transport);
     await transport.handleRequest(req.raw, reply.raw, req.body);

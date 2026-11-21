@@ -279,7 +279,7 @@ as a tab, and the app bar's **+** offers a session or app key.
 | What may this user see, and what can I change? | The **user page** (`#user/<id>`) shows, for a member, one access block per project: a preset (Blueprint only, Follow the work, Full project), the parts as boxes (Graph needs Vault, Topology needs Tasks; ticking or unticking keeps them consistent), vault folders only when Vault is ticked, and an Exports switch; **Save access** saves the draft and shows what the server changed. Beside it: the account with **Edit** (making someone an admin asks once more), the teams they decide for, and a danger zone with **Reset password** (shows a new generated password once and signs the user out everywhere) and Disable or Enable user (both ask once more; on phones, in the overflow). An admin's page says admins see every project. |
 | Is anything waiting for access? | **Requests** shows pending access requests and their requested scope. The Security button and Requests view show a badge while requests are pending. |
 | Which keys are active, and what do they grant? | **Keys** filters by status. Open a key to inspect its rules and simulate access. |
-| What is this key, and what may it do? | The key's **Overview** answers in reading order: what the key is (kind, agent or PC and app, the PC and app it logs in through, the PC binding, status and live logins (a session key that never logged in has **Make a new prompt** beside its status: the same act as Rotate secret, with softer wording and a note that the old prompt stops working), for an app key its **Login limit** (default 100, 1 to 500) with **Change limit** in a sheet that saves, is audited and applies at the next login, created and first used, last used, expiry, the key it replaces); what it may do (folders, tools and rules, each a row that opens its tab, and **Simulate a call**); recent use in the last hour (calls, denied, live logins, the latest denials, a door to every call in Audit); and a danger zone where each action says what it does: Rotate secret, End logins, Suspend or Resume key, Revoke key. Rotate and Revoke ask once more (Rotate secret on a session key opens a sheet that asks "Could this key have leaked?" and offers Collect on the PC or a key prompt, [onboarding](onboarding.md#collect-on-a-pc-the-codex-wake-picks-up-a-routine-rotation); a key with a collection shows its status card first). On phones the danger zone is in the overflow. The **PC binding** switch (session keys) binds the key to the PC it logs in through, or asks which PC when it has none; off frees it; **Change PC** picks another. It applies at the next login. |
+| What is this key, and what may it do? | The key's **Overview** answers in reading order: what the key is (kind, agent or PC and app, the PC and app it logs in through, the PC binding, status and live logins (a session key that never logged in has **Make a new prompt** beside its status: the same act as Rotate secret, with softer wording and a note that the old prompt stops working), for an app key its **Login limit** (default 100, 1 to 500) with **Change limit** in a sheet that saves, is audited and applies at the next login, created and first used, last used, expiry, the key it replaces); what it may do (folders, tools and rules, each a row that opens its tab, and **Simulate a call**); recent use in the last hour (calls, denied, live logins, the latest denials, a door to every call in Audit); and a danger zone where each action says what it does: Rotate secret, End logins, Suspend or Resume key, Revoke key. Rotate and Revoke ask once more (Rotate secret on a session key opens a sheet that asks "Could this key have leaked?" and offers **Rotate and send to <PC>** by [key handover](onboarding.md#key-handover-a-rotated-key-or-a-recruit-reaches-a-connector-pc), or **Rotate and show the key once** for a key with no connector PC; a key with an open handover shows its status card first). On phones the danger zone is in the overflow. The **PC binding** switch (session keys) binds the key to the PC it logs in through, or asks which PC when it has none; off frees it; **Change PC** picks another. It applies at the next login. |
 | What is shared? | **Shares** shows shared items and their details. |
 | How do I give a session or device access? | **Agent access** offers a session key with a permission template and expiry, or an app key for a new or existing device. The Security bar's **New** menu opens the same forms directly (**Session key**, **App key**); the Keys header has no buttons of its own. |
 | Which app keys can file team requests? | The key list says "Onboarding on" in an app key's line; the key's Overview has an **Onboarding** row ("On since <date>" or "Off") with a switch. On is one click; off asks first ([Onboarding](onboarding.md)). |
@@ -294,17 +294,23 @@ phone action bar opens the same screen.
 - **Fields.** The PC name, and an optional "What the team should do" (the project, the goal, the roles). Its text is
   appended to the prompt's closing "What I want:", so the person at the PC adds nothing. The agent asks for whatever is
   missing.
-- **The prompt.** **Get the prompt** calls `POST /api/pcs/add`. Then, in place, three numbered steps. **1.** Install
-  the connector: the installer file, `conclave-install-<version>.mjs`, named after the newest approved connector version
-  (`connector_version`), with the GitHub Releases link when the hub has one, and the command that runs it,
-  `node conclave-install-<version>.mjs`, as a chip. **2.** The pairing step, with the code and the hub check as chips
-  (`--r-chip`) for the connector's pairing screen, the code's 30 minutes and the time it runs out. **3.** "Open <the
-  PC's coding agent> on <PC> and paste this prompt into it", then the connector prompt (`connector_prompt`) with
-  **Copy prompt** and the hub's address. The prompt holds no code and no key. There is no other prompt: when `connector_prompt` is null the
-  screen says why instead (no CA certificate on the hub, or no HTTPS public address) and how to fix it, with only
-  **Done**. Re-enrol PC shows the same pairing step and prompt, or the same reason. The code is not shown again:
-  **Re-enrol PC** on the PC's page makes a new one. Editing "What the team should do" after the prompt is created
+- **The prompt.** **Get the prompt** calls `POST /api/pcs/add`. Then, in place, one line and the one prompt
+  (`connector_prompt`) with **Copy prompt** and the hub's address. The line says to give the prompt to the user of <PC>
+  directly, not through a shared chat; that they paste it into <the PC's coding agent>, which installs the connector,
+  pairs it and files the team request; that it holds a pairing code that works once, for 30 minutes (until the time it
+  runs out), and only with this hub; and that **New prompt** makes a new code and voids this one. **New prompt**
+  (`POST /api/pcs/:id/prompt`, asks once more by arming the button) replaces the prompt in place; it is hidden once the PC
+  has used its code. There is no other prompt: when `connector_prompt` is null the screen says why instead (no CA
+  certificate on the hub, or no HTTPS public address) and how to fix it, with only **Done**. Re-enrol PC shows the same
+  line and prompt, with New prompt, or the same reason. Editing "What the team should do" after the prompt is created
   updates the prompt.
+- **Paired just now.** When the code is used, Needs you on Home shows **Paired just now** for that PC: the time, the
+  address it came from, and the connector's version and platform, then the warning, with **It was me** and **Revoke**. The
+  banner wraps rather than cutting its text. **Revoke** asks once, in a sheet that names what it ends, and its toast says
+  "Pairing revoked for <PC>". It stays until one of them is chosen ([onboarding.md](onboarding.md#paired-just-now)).
+- **Revoke elsewhere.** Every revoke in the console asks once and says what ends (a key: "Revoke? Logins stop for good";
+  a share: "Revoke? Recipients lose access"; a grant: "Revoke? Access ends now"; a PC's code: "Revoke? The code stops
+  working"), and its toast names what was revoked.
 - **Live status.** While the screen stays open it follows the PC every 3 s through the existing routes
   (`GET /api/pcs/:id/enrolment`, then `GET /api/onboarding?status=pending`): "Waiting for <PC> to enrol…",
   "<PC> is enrolling…", "<PC> enrolled. Waiting for its request…", then "Request filed for <team>", with **Review it**,
@@ -516,7 +522,9 @@ expiry. Each row's **Open checkout** opens `#tco/<team>`. A team held by a check
 header has two sections: **Onboarding** (the request limits) and **Checkout · repo hosts**, the allowlist a handout's
 repo URL must match ([checkout](checkout.md) §8). That section has a row per host with a remove button, an add row and
 a line saying whether the list comes from settings, the environment or the default. Save writes it only when it
-changed.
+changed. Each limit and section says what it does in one plain line under its label, not behind an info button (on a
+phone an info button opens a sheet of its own in place of this one), and titles and help lines wrap rather than being
+cut off; **Claim all existing agents as mine** sits on its own line under its row.
 
 The **Blueprint card** replaces Objective; a team page shows exactly one ([blueprint](blueprint.md) §9). Its header is
 the overline every card has, "BLUEPRINT · IMPLEMENTATION" ("RESEARCH" for a research project: the kind sits where the
@@ -1004,8 +1012,8 @@ card style throughout, each card with the same header:
   logins, team, project, model).
 - **Agent status.** **Connected** is the time of the agent's first call after signing in, or **Not connected yet**;
   **Last active** is its latest call. Both come from the hub's own records (`agents.connected_at`,
-  `agents.last_active_at`), and the headers helper's own calls (`session_login`, `session_whoami`) never set them, so
-  the setup login test does not show an agent that never started as connected. Member rows and session cards show Last
+  `agents.last_active_at`), and sign-in calls on their own (`session_login`, `session_whoami`, such as the connector's
+  sign-in check) never set them, so a sign-in check does not show an agent that never started as connected. Member rows and session cards show Last
   active the same way, and a PC's agent list leaves out agents that only signed in.
 - **One column** (below 1180 px): **Status**, **Tell the agent**, **Inbox**, **Role**, **Team playbooks**,
   **Directives**. On a small screen the first question is whether the agent is live; the action follows. Each card is

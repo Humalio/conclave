@@ -18,7 +18,7 @@ import { testConfig, adminLogin } from './hub.js';
 const sys = { kind: 'system' as const, id: null };
 type Res = { isError?: boolean; structuredContent?: any; content?: { text: string }[] };
 type Call = (name: string, args?: Record<string, unknown>) => Promise<Res>;
-let app: App, base = '', cookie = '', csrf = '', appKey = '';
+let app: App, base = '', cookie = '', csrf = '', appKey = '', pcId = '';
 const text = (r: Res) => (r.content ?? []).map((c) => c.text).join('\n');
 const ok = (r: Res) => { if (r.isError) throw new Error(text(r)); return r.structuredContent; };
 const code = (r: Res) => (r.isError ? /^(\w+)/.exec(text(r))?.[1] : 'ok');
@@ -66,6 +66,7 @@ beforeAll(async () => {
   base = `http://127.0.0.1:${(app.fastify.server.address() as { port: number }).port}`;
   ({ cookie, csrf } = await adminLogin(base, 'admin', 'admin-password-long'));
   const pc = (await api('POST', '/pcs', { name: 'pc' })).body.pc.id as string;
+  pcId = pc;
   appKey = app.keys.createAppKey({ machineId: pc, appName: 'claude-code', maxLiveSessions: 40 }, sys).secret;
 });
 afterAll(async () => { await app?.close(); });
@@ -136,6 +137,18 @@ describe('intake backlog (the default)', () => {
 });
 
 describe('the operator moves the backlog', () => {
+  it('the accept wakes an on-demand coordinator: one delivery order on its PC for the accepted task, ids only (feedback: the accept never woke the coordinator)', async () => {
+    const X = await team('WakeAccept');
+    app.db.prepare('UPDATE credentials SET bound_machine_id=? WHERE id=?').run(pcId, X.c.cred); // the coordinator works on this PC
+    const t = await create(X, { claimable: true });
+    const orders = async () => ((await (await fetch(`${base}/connector/v1/orders`, { headers: { authorization: `Bearer ${appKey}` } })).json()) as { orders: { kind: string; payload: { agent_id: string; items: { notice: string; task?: string }[] } }[] }).orders;
+    expect((await orders()).filter((o) => o.payload.agent_id === X.c.id)).toHaveLength(0); // a backlog proposal wakes no one
+    expect((await api('POST', `/teams/${X.id}/tasks/${t.id}/accept`, { note: 'Go.' })).status).toBe(200);
+    const mine = (await orders()).filter((o) => o.payload.agent_id === X.c.id);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]).toMatchObject({ kind: 'deliver', payload: { items: [{ notice: 'task_accepted', task: t.id }] } });
+    expect(JSON.stringify(mine[0])).not.toContain(t.title); // ids only
+  });
   it('accept: backlog → open with a note, audited, the creator and the coordinators told; then it works as before', async () => {
     const X = await team('Accept');
     const t = await create(X, { claimable: true });

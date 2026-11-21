@@ -458,7 +458,7 @@ const pairApi = (calls, over = {}) => () => ({
 describe('conclave sync commands', () => {
   test('the code has a fixed shape', () => {
     assert.ok(CODE_RE.test(GOOD), GOOD);
-    for (const bad of ['', 'cnv_enrol_' + 'a'.repeat(26), 'cnv_vsync_short', 'cnv_vsync_' + 'A'.repeat(26)]) assert.equal(CODE_RE.test(bad), false);
+    for (const bad of ['', 'cnc-pair-' + 'a'.repeat(26), 'cnv_vsync_short', 'cnv_vsync_' + 'A'.repeat(26)]) assert.equal(CODE_RE.test(bad), false);
   });
   test('add redeems the code, keeps the key in the key file under vsync-<id>, confirms, and records the sync', async () => {
     const home = pairedHome(), folder = join(mk(), 'mirror'), calls = [];

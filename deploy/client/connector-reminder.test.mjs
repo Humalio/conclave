@@ -14,7 +14,7 @@ import { testCa } from '../../server/test/test-ca.mjs';
 import { putHub, putAgentKey, caFingerprint } from './connector/keyfile.mjs';
 import { registerFolder, repairFolder } from './connector/register.mjs';
 import { reminderLine, senderName } from './connector/reminder.mjs';
-import { runHook } from './connector/hook.mjs';
+import { runHook, forgetShown } from './connector/hook.mjs';
 import { startBroker } from './connector/broker.mjs';
 import { approveFolderByConnector } from './connector/approvals.mjs';
 import { resolveFolder } from './connector/registry.mjs';
@@ -128,7 +128,7 @@ describe('the Claude Code hook', () => {
 
   test('at prompt submit and at session start it adds the line as context, and only that', async () => {
     for (const name of ['UserPromptSubmit', 'SessionStart']) {
-      hub.mode = 'ok';
+      hub.mode = 'ok'; forgetShown();
       const r = await runCli(s, s.folder, ev(name));
       assert.equal(r.code, 0);
       const j = JSON.parse(r.out);
@@ -138,7 +138,7 @@ describe('the Claude Code hook', () => {
     }
   });
   test('it tells the hub which messages it showed', async () => {
-    hub.shown.length = 0; hub.mode = 'ok';
+    hub.shown.length = 0; hub.mode = 'ok'; forgetShown();
     await runCli(s, s.folder, ev('UserPromptSubmit'));
     assert.deepEqual(hub.shown, [{ agent_id: 'agt_1', room_id: 'room_1', seq: 7 }]);
   });
@@ -158,6 +158,37 @@ describe('the Claude Code hook', () => {
     const r = await runCli(s, s.folder, ev('UserPromptSubmit'));
     hub.counts = COUNTS;
     assert.equal(r.code, 0); assert.equal(r.out, '');
+  });
+  test('the unread line shows when the counts change, not at every prompt', async () => {
+    hub.mode = 'ok'; forgetShown(); hub.shown.length = 0;
+    const out = async () => (await runCli(s, s.folder, ev('UserPromptSubmit'))).out;
+    const first = await out();
+    assert.equal(JSON.parse(first).hookSpecificOutput.additionalContext, reminderLine(COUNTS));
+    assert.equal(await out(), '', 'the same counts again: nothing');
+    assert.equal(await out(), '', 'and again');
+    assert.equal(hub.shown.length, 1, 'the PC reports the messages shown once, not at the prompts that showed nothing');
+    const more = { ...COUNTS, total: COUNTS.total + 1 };
+    hub.counts = more;
+    assert.equal(JSON.parse(await out()).hookSpecificOutput.additionalContext, reminderLine(more), 'a changed count shows again');
+    assert.equal(await out(), '');
+    hub.counts = { total: 0, senders: [], rooms: [], directives: 0 };
+    assert.equal(await out(), '', 'nothing waits: nothing, and the memory clears');
+    hub.counts = more;
+    assert.equal(JSON.parse(await out()).hookSpecificOutput.additionalContext, reminderLine(more), 'the same counts after a clear show again');
+    hub.counts = COUNTS;
+  });
+  test('new messages that give the same line are still shown (a higher top_seq), and so is a new directive', async () => {
+    hub.mode = 'ok'; forgetShown(); hub.shown.length = 0;
+    const out = async () => (await runCli(s, s.folder, ev('UserPromptSubmit'))).out;
+    const first = await out();
+    assert.ok(first, 'shown the first time');
+    assert.equal(await out(), '', 'the same state again: nothing');
+    // Two messages were read and two new ones from the same sender arrived: the counts and the line are the same, the room's top_seq is not.
+    hub.counts = { ...COUNTS, rooms: [{ room_id: 'room_1', top_seq: 9 }] };
+    assert.equal(reminderLine(hub.counts), reminderLine(COUNTS), 'the same text');
+    assert.equal(JSON.parse(await out()).hookSpecificOutput.additionalContext, reminderLine(COUNTS), 'but it is shown again');
+    assert.equal(await out(), '');
+    hub.counts = COUNTS;
   });
   test('a hub error gives no output and exit code 0', async () => {
     hub.mode = 'error';
@@ -197,6 +228,7 @@ describe('Codex gets the line at the start of a woken turn', () => {
     setTimeout(() => c.stdin.end(), 1500);
   });
   test('the first tool result of a Codex turn ends with the line, once', async () => {
+    forgetShown();
     const r = await run('codex-mcp-client');
     const texts = (id) => r.find((x) => x.id === id).result.content.map((c) => c.text);
     assert.deepEqual(texts(2), ['the tool answered', reminderLine(COUNTS)]);

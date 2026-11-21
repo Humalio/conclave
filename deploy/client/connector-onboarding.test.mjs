@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { testCa } from '../../server/test/test-ca.mjs';
 import { pair, checkHub, normalizeCheck, PAIR_LINES } from './connector/pairing.mjs';
-import { readKeyFile } from './connector/keyfile.mjs';
+import { readKeyFile, putAgentKey } from './connector/keyfile.mjs';
 import { startScreen } from './connector/screen.mjs';
 import { fileRequest, advance as advanceRaw, agentRows, retryAgent, loadSetup, openWays, pending } from './connector/onboard.mjs';
 import { installPrivateGit, gitState, GIT_OFFER, CODEX_GIT, MINGIT } from './connector/git.mjs';
@@ -22,7 +22,8 @@ import { OVERRIDE_MARKER, overrideState, roleFileProblem } from './connector/rol
 import { trustStatus } from './connector/trust.mjs';
 import { runCheck } from './connector/check.mjs';
 import { commitFiles } from './connector/commit.mjs';
-import { pendingList, approvePickup, folderApproved } from './connector/approvals.mjs';
+import { pendingList, approvePickup, folderApproved, requestPickup, pickupApproved } from './connector/approvals.mjs';
+import { writeMarker, io } from './connector/isolation.mjs';
 import { summary as requestSummary } from './connector/request.mjs';
 process.env.CONCLAVE_KEY_STORE = 'file';
 /** Setup as the PC's user drives it: when a key pickup waits for the click on the screen, click it and go on. */
@@ -34,7 +35,7 @@ async function advance(home, hubKey, o) {
 }
 import { spawnSync } from 'node:child_process';
 
-const CODE = 'cnv_enrol_' + 'a'.repeat(26);
+const CODE = 'cnc-pair-' + 'a'.repeat(26);
 const APP_KEY = 'ah_app_aaaabbbbcccc_' + 'x'.repeat(30);
 const tmp = (p) => mkdtempSync(join(tmpdir(), `cnob-${p}-`));
 const check16 = (sha) => sha.slice(0, 16).match(/.{4}/g).join(' ');
@@ -335,14 +336,10 @@ describe('setup with the connector', () => {
     const devDir = join(root, 'Atlas', 'developer-1');
     mkdirSync(join(root, 'Atlas'), { recursive: true });
     writeFileSync(devDir, 'not a folder');
-    // At standard isolation the key pickup waits for the PC user's click on the screen: nothing is picked up before it.
-    const waiting = await advanceRaw(home, hubKey, opts());
-    assert.deepEqual([waiting.phase, waiting.pickup_click, waiting.stage, hub.st.pickups], ['waiting', true, 'allow', 0]);
-    assert.deepEqual((await agentRows(home, hubKey)).agents.map((a) => [a.state, a.text]), [['waiting_for_allow', 'Waiting for your Allow'], ['waiting_for_allow', 'Waiting for your Allow']], 'approved, but the keys wait for the PC user pressing Allow: not "ready to open"');
-    assert.deepEqual(pendingList(home).pickups.map((k) => k.folders.length), [2], 'the row lists the folders the click also allows');
-    assert.equal(pendingList(home).pickups.length, 1);
-    const r = await advance(home, hubKey, opts());
+    // A request this PC filed picks up its keys by itself at the standard level: no click, and no click left over to reuse.
+    const r = await advanceRaw(home, hubKey, opts());
     assert.equal(r.phase, 'set_up');
+    assert.deepEqual(pendingList(home).pickups, [], 'no Allow was asked for');
     assert.deepEqual(r.built, ['coordinator']);
     assert.equal(r.failed[0].label, 'developer-1');
     assert.deepEqual(hub.st.confirmed, { pickup_id: 'opk_1', written: ['CONCLAVE_T_COORDINATOR_SESSION_KEY', 'CONCLAVE_T_DEVELOPER_1_SESSION_KEY'], transport: 'https' });
@@ -387,6 +384,37 @@ describe('setup with the connector', () => {
 });
 
 const hasGit = spawnSync('git', ['--version']).status === 0;
+
+describe('setup into a folder that already holds files', () => {
+  test('is built and registered, but its first chat still needs its own click; an empty one is allowed with the pickup', async () => {
+    const pki = testCa('Prefilled hub CA'), hub = await stubHub(pki);
+    const home = tmp('prefilled'), root = tmp('prefilled-root');
+    try {
+      const claudeJson = join(home, 'claude.json');
+      writeFileSync(join(home, 'conclave.mjs'), '// launcher');
+      const hubKey = (await pair(home, { origin: hub.origin, check: check16(pki.caSha256), code: CODE })).hubKey;
+      const o = { claudeJson, gitBin: null, node: process.execPath, connector: join(home, 'conclave.mjs') };
+      const request = { kind: 'new_team', project: { name: 'Atlas', existing: false }, team: { name: 'Grants', goal: 'Keep the calendar.' },
+        roles: [{ name: 'coordinator', team_role: 'coordinator', count: 1, job: 'Plans.' }, { name: 'developer', team_role: 'worker', count: 1, job: 'Builds.' }],
+        prompt: 'a small team', client: { app: 'claude-code', os: 'windows' } };
+      assert.equal((await fileRequest(home, hubKey, request, { root })).request_id, 'obr_1');
+      // The coordinator's folder already holds someone's files; the developer's exists and is empty.
+      const coord = join(root, 'Atlas', 'coordinator'), dev = join(root, 'Atlas', 'developer-1');
+      mkdirSync(coord, { recursive: true }); mkdirSync(dev, { recursive: true });
+      writeFileSync(join(coord, 'notes.txt'), 'something that was here before');
+      hub.st.state = 'approved';
+      const r = await advance(home, hubKey, o);
+      assert.equal(r.phase, 'set_up', JSON.stringify(r));
+      assert.deepEqual(r.built.sort(), ['coordinator', 'developer-1']);
+      const c = resolveFolder(home, coord), d = resolveFolder(home, dev);
+      assert.equal(c.ok && d.ok, true, 'both folders are registered');
+      assert.equal(folderApproved(home, coord, c.binding), false, 'a folder that already held files waits for its own click');
+      assert.equal(folderApproved(home, dev, d.binding), true, 'an empty one is allowed with the pickup the user clicked');
+      assert.equal(readFileSync(join(coord, 'notes.txt'), 'utf8'), 'something that was here before', 'what was there is left as it was');
+      assert.equal(pendingList(home).folders.length, 0, 'the click is asked when a chat opens there, not before');
+    } finally { hub.server.close(); }
+  });
+});
 
 describe('setup with the connector, for Codex agents (the layout a restored Codex agent gets)', () => {
   let hubPki, hub, home, hubKey, claudeJson, root;
@@ -578,4 +606,96 @@ test('the request summary names the source of the requirements in a whole senten
   assert.equal(line('coordinator'), 'The coordinator derives the requirements or the brief.');
   assert.equal(line('existing', 'docs/spec.md'), 'The requirements or the brief come from an existing source: docs/spec.md.');
   assert.doesNotMatch(requestSummary({ ...base, source: { from: 'operator' } }), /come from you/);
+});
+
+// docs/onboarding.md "Continue setup" and "One-time pickup, retries and a lost response": the list is saved first (no
+// secrets), then the keys. A crash after the list and before the keys picks up again; a crash after the keys only confirms.
+// Each crash is simulated by writing the state file exactly as that crash leaves it, then running the next step.
+describe('setup with the connector survives a crash between pickup and confirm', () => {
+  const HUB = 'hub-aaaabbbbcccc';
+  const listOf = (client = 'claude-code') => [
+    { agent_id: 'agt_coord', label: 'coordinator', hub_label: 'Coordinator', role: 'coordinator', team_role: 'coordinator', session_var: 'CONCLAVE_T_COORDINATOR_SESSION_KEY', folder: 'coordinator', client, instructions: '# You are the coordinator\n', built: false, error: null },
+    { agent_id: 'agt_dev', label: 'developer-1', hub_label: 'Developer 1', role: 'developer', team_role: 'worker', session_var: 'CONCLAVE_T_DEVELOPER_1_SESSION_KEY', folder: 'developer-1', client, instructions: '# You are a developer\n', built: false, error: null },
+  ];
+  async function world() {
+    const pki = testCa('Crash hub CA'), hub = await stubHub(pki);
+    try { return await build(pki, hub); } catch (e) { hub.server.closeAllConnections?.(); hub.server.close(); throw e; }
+  }
+  async function build(pki, hub) {
+    const home = tmp('crash'), root = tmp('crash-root'), claudeJson = join(home, 'claude.json');
+    writeFileSync(join(home, 'conclave.mjs'), '// launcher\n');
+    const hubKey = (await pair(home, { origin: hub.origin, check: check16(pki.caSha256), code: CODE })).hubKey;
+    const o = { claudeJson, gitBin: null, node: process.execPath, connector: join(home, 'conclave.mjs') };
+    const request = { kind: 'new_team', project: { name: 'Atlas', existing: false }, team: { name: 'Grants', goal: 'Keep the calendar.' },
+      roles: [{ name: 'coordinator', team_role: 'coordinator', count: 1, job: 'Plans.' }, { name: 'developer', team_role: 'worker', count: 1, job: 'Builds.' }],
+      prompt: 'a small team', client: { app: 'claude-code', os: 'windows' } };
+    assert.equal((await fileRequest(home, hubKey, request, { root })).request_id, 'obr_1');
+    hub.st.state = 'approved';
+    // The pickup was allowed before the crash: with no click for a request this PC filed itself (standard level), or with the PC user's click. Either way it lasts until the confirm.
+    requestPickup(home, hubKey, 'obr_1', 'session keys for a team', []);
+    for (const k of pendingList(home).pickups) approvePickup(home, k.key);
+    return { hub, home, hubKey, o };
+  }
+  /** The state file as the crash left it: the first pickup (opk_1) happened on the hub. */
+  function crashState(w, { keysWritten }) {
+    const s = loadSetup(w.home, HUB);
+    s.hub_key = w.hubKey; s.request.state = 'approved'; s.request.team_id = 'team_1';
+    s.pickup_id = 'opk_1'; s.agents = listOf();
+    if (keysWritten) {
+      s.keys_written_for = 'opk_1';
+      for (const a of s.agents) putAgentKey(w.home, w.hubKey, a.label, `ah_ses_${a.agent_id.slice(4).padEnd(12, 'z')}_secret`);
+    }
+    writeFileSync(join(w.home, 'onboarding', `${HUB}.json`), JSON.stringify(s, null, 2) + '\n');
+    w.hub.st.pickups = 1;
+  }
+
+  test('a crash after the list was saved and before the keys were written picks up again, without a second click', async () => {
+    const w = await world();
+    try {
+      crashState(w, { keysWritten: false });
+      assert.equal(readKeyFile(w.home).data.hubs[w.hubKey].agents?.coordinator, undefined, 'no key was written before the crash');
+      const r = await advanceRaw(w.home, w.hubKey, w.o);
+      assert.equal(r.phase, 'set_up', JSON.stringify(r));
+      assert.equal(r.pickup_click, undefined, 'the click from before the crash still covers this request');
+      assert.equal(w.hub.st.pickups, 2, 'a second pickup');
+      assert.equal(w.hub.st.confirmed.pickup_id, 'opk_2', 'and the confirm names the new pickup');
+      assert.deepEqual(Object.keys(readKeyFile(w.home).data.hubs[w.hubKey].agents).sort(), ['coordinator', 'developer-1'], 'the same labels, no agent added twice');
+      assert.equal(pendingList(w.home).pickups.length, 0);
+    } finally { w.hub.server.closeAllConnections?.(); w.hub.server.close(); }
+  });
+
+  test('a crash after the keys were written and before confirm only confirms: no second pickup', async () => {
+    const w = await world();
+    try {
+      crashState(w, { keysWritten: true });
+      const r = await advanceRaw(w.home, w.hubKey, w.o);
+      assert.equal(r.phase, 'set_up', JSON.stringify(r));
+      assert.equal(w.hub.st.pickups, 1, 'no second pickup');
+      assert.deepEqual(w.hub.st.confirmed, { pickup_id: 'opk_1', written: ['CONCLAVE_T_COORDINATOR_SESSION_KEY', 'CONCLAVE_T_DEVELOPER_1_SESSION_KEY'], transport: 'https' });
+      assert.deepEqual(r.built.sort(), ['coordinator', 'developer-1']);
+      // Confirmed: the click is spent, and a later Continue setup asks the hub for nothing more.
+      const again = await advanceRaw(w.home, w.hubKey, w.o);
+      assert.equal(again.phase, 'set_up');
+      assert.equal(w.hub.st.pickups, 1);
+    } finally { w.hub.server.closeAllConnections?.(); w.hub.server.close(); }
+  });
+
+  test('at Hardened a crash between pickup and confirm keeps the given click, and the next run only confirms: no second pickup', async () => {
+    const w = await world(), realRun = io.run;
+    try {
+      // The PC user's click was given before the crash; the keys are held by the service, so the marker says Hardened.
+      crashState(w, { keysWritten: true });
+      // The key service is a stand-in: its public view is the key file as it is, and the one write it is asked for (the swap at confirm) answers ok.
+      const view = join(w.home, 'keyview.json'); writeFileSync(view, JSON.stringify(readKeyFile(w.home).data));
+      writeMarker(w.home, { address: 'pipe-or-socket', view, vault: null });
+      io.run = () => ({ ok: true, committed: 2, discarded: true });
+      assert.equal(pickupApproved(w.home, w.hubKey, 'obr_1'), true, 'the click is still given');
+      const r = await advanceRaw(w.home, w.hubKey, w.o);
+      assert.equal(r.pickup_click, undefined, 'no second click is asked for');
+      assert.equal(r.phase, 'set_up', JSON.stringify(r));
+      assert.equal(w.hub.st.pickups, 1, 'no second pickup');
+      assert.equal(w.hub.st.confirmed.pickup_id, 'opk_1');
+      assert.equal(pickupApproved(w.home, w.hubKey, 'obr_1'), false, 'spent at the confirm');
+    } finally { io.run = realRun; w.hub.server.closeAllConnections?.(); w.hub.server.close(); }
+  });
 });

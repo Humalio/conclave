@@ -389,7 +389,10 @@ async function setupCmd(cmd, argv) {
     for await (const c of process.stdin) { code += c; if (code.length > 200) break; }
     const r = await pair(home, { origin: f.hub, check: f.check, code: code.trim() });
     process[r.ok ? 'stdout' : 'stderr'].write(`${r.ok ? PAIR_LINES.paired : `conclave: ${PAIR_LINES[r.reason] ?? r.reason}`}\n`);
-    return r.ok ? 0 : r.reason === 'ca_changed' || r.reason === 'origin_changed' ? 3 : 1;
+    // What the code was for, as fixed words an installer or an agent can read: `code_kind: pc`, or `code_kind: invite <id>`.
+    if (r.ok) process.stdout.write('hub: ' + String(r.hub?.id ?? '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 80) + '\n' + 'code_kind: ' + r.kind + (r.invite?.id ? ' ' + String(r.invite.id).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 80) : '') + '\n');
+    // 3: the hub is not the one given (nothing was sent) or it changed; 1: anything else.
+    return r.ok ? 0 : ['ca_changed', 'origin_changed', 'ca_mismatch', 'origin_mismatch', 'tls_refused', 'no_ca', 'ca_bundle'].includes(r.reason) ? 3 : 1;
   }
   const sub = argv[0] && !argv[0].startsWith('-') ? argv[0] : null;
   const args = sub ? argv.slice(1) : argv;
@@ -426,10 +429,18 @@ async function setupCmd(cmd, argv) {
       return 0;
     } catch (e) { process.stderr.write(`conclave: ${e.message}\n`); if (Array.isArray(e.hub?.problems)) for (const x of e.hub.problems) process.stderr.write(`- ${x.field}: ${x.rule}\n`); return 1; }
   }
-  const f = flags(args.filter((a, i) => !(sub === 'retry' && i === 0)), ['--hub', '--wait'], ['--json']);
+  const f = flags(args.filter((a, i) => !((sub === 'retry' || sub === 'redeem') && i === 0)), ['--hub', '--wait', '--root', '--client'], ['--json']);
   const hubKey = pickHub(f.hub);
   if (!hubKey) return 1;
   try {
+    if (sub === 'choices') { process.stdout.write(JSON.stringify(await ob.choices(home, hubKey)) + '\n'); return 0; }
+    if (sub === 'redeem') {
+      if (!args[0] || args[0].startsWith('-')) usage('setup redeem needs the invite id');
+      const r = await ob.redeemInvite(home, hubKey, args[0], { root: f.root, client: f.client });
+      if (!r.ok) { process.stderr.write('conclave: ' + r.message + '\n'); return 1; }
+      process.stdout.write('Redeemed the invite: request ' + r.request_id + ' (' + r.state + '). Run conclave setup continue --wait 30 to pick up the keys and build the folder.\n');
+      return 0;
+    }
     if (sub === 'continue') {
       const r = await ob.advance(home, hubKey, { waitS: Number(f.wait ?? 0) || 0, claudeJson });
       process.stdout.write(`${r.phase === 'waiting' ? (r.declined ? 'The key pickup was declined on this PC. The PC user can still allow it on the connector screen (conclave setup).' : r.stage === 'allow' ? 'Approved. Waiting for the PC user to press Allow on the connector screen (conclave setup) before the keys are picked up.' : 'Waiting for your administrator to approve the request.') : r.phase === 'changes' ? `Changes asked by your administrator (their words): ${r.note ?? ''}` : r.phase === 'closed' ? `The request was ${r.state}.` : r.phase === 'no_request' ? 'No team request yet: file one with conclave setup request --file <path>.' : `Set up: ${r.built.join(', ') || 'none'}.${r.failed.length ? ` Not set up: ${r.failed.map((x) => `${x.label} (${x.error})`).join('; ')}.` : ''}`}\n`);
@@ -459,7 +470,7 @@ async function setupCmd(cmd, argv) {
       return r.ok ? 0 : 1;
     }
   } catch (e) { process.stderr.write(`conclave: ${e.message}\n`); return 1; }
-  usage('setup takes schema, request, continue, status, retry or withdraw');
+  usage('setup takes schema, request, choices, redeem, continue, status, retry or withdraw');
 }
 
 function REASON_FOR(code) { return code === 'entry_foreign' ? 'this folder has its own MCP entry named conclave; it was left alone.' : line(code).replace(/ Run: .*$/, ''); }

@@ -27,7 +27,7 @@ describe('Security tab bar', () => {
   });
   it('the phone tabs end with Agent access, have no Reset tab and no New button', () => {
     const m = bar.slice(bar.indexOf('<nav class="tabs only-m"'));
-    expect([...m.slice(0, m.indexOf('</nav>')).matchAll(/data-go="([a-z]+)"/g)].map((x) => x[1])).toEqual(['keys', 'pcs', 'hardware', 'users', 'req', 'shares', 'grant']);
+    expect([...m.slice(0, m.indexOf('</nav>')).matchAll(/data-go="([a-z]+)"/g)].map((x) => x[1])).toEqual(['keys', 'pcs', 'hardware', 'users', 'req', 'shares', 'db', 'grant']);
     expect(m).not.toContain('data-sec-new');
   });
   it('Reset is a danger zone at the end of the Lockdown page, for admins only (operator walk-through finding 3)', () => {

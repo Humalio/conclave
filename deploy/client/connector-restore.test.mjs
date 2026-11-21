@@ -18,7 +18,7 @@ import { connect } from './connector/hubclient.mjs';
 import { repairFolder } from './connector/register.mjs';
 import { codexPermission, codexToml } from './connector/entries.mjs';
 import { addDestination, destinationChanged, listDestinations, reportDestinations, resolveDestination, removeDestination } from './connector/destinations.mjs';
-import { pendingList, approvePickup } from './connector/approvals.mjs';
+import { pendingList, approvePickup, folderApproved } from './connector/approvals.mjs';
 import { verifyHandouts, repoPlan, prepareRepo, scanFolder, startLine, resumeMsg, writeAgentFiles, codexRoleBlock, beginRestore, runRestore as runRestoreRaw, activeRestores, restorePath } from './connector/restore.mjs';
 import { OVERRIDE_MARKER, overrideState } from './connector/role.mjs';
 import { resolveFolder } from './connector/registry.mjs';
@@ -367,6 +367,21 @@ describe('a restore run', { skip: !hasGit }, () => {
       assert.match(r.start_lines[0], /claude/);
       assert.match(r.start_lines[0], /checkout_resume/);
       assert.equal(activeRestores(w.home, w.hubKey).length, 0);
+      assert.equal(folderApproved(w.home, dir, resolveFolder(w.home, dir).binding), true, 'a folder the user approved on the restore screen, with its trust given, needs no second click');
+    } finally { w.close(); }
+  });
+
+  test('a restore folder whose trust the hub did not give is built, but its first chat still needs its own click', async () => {
+    const w = await world(view());
+    try {
+      w.hub.trust = { f0: false };
+      const r = await runRestore(w.cx, beginRestore(w.home, w.hubKey, w.order));
+      assert.equal(r.phase, 'done', JSON.stringify(r));
+      const dir = join(w.dest, 'Proj', 'f0');
+      const b = resolveFolder(w.home, dir);
+      assert.equal(b.ok, true, 'the folder is built and registered');
+      assert.equal(folderApproved(w.home, dir, b.binding), false, 'but nobody allowed a chat in it yet');
+      assert.equal(existsSync(w.claudeJson), false, 'and no trust was written');
     } finally { w.close(); }
   });
 
@@ -530,4 +545,92 @@ describe('a restore run', { skip: !hasGit }, () => {
     } finally { w.close(); }
   });
 
+});
+
+// docs/checkout.md §6 "Restore by the connector", target other_pc (docs/acceptance.md "Restore target"): the PC is paired,
+// the request waits for the administrator, then the restore clones from a real git remote (a bare repository in a temporary
+// folder, reached through an https URL that a git config of this test's own rewrites to it), or fetches and fast-forwards a
+// clean clone that is already there. Nothing is pushed.
+describe('a restore to another PC, from a real remote', { skip: !hasGit }, () => {
+  let pki;
+  before(() => { pki = testCa('Other PC restore CA'); });
+  const URL_ = 'https://git.other.example/core.git';
+  function remote() {
+    const root = mk('cn-rst-remote-');
+    const bare = join(root, 'core.git'), work = join(root, 'work');
+    mkdirSync(work);
+    spawnSync('git', ['init', '-q', '--bare', '-b', 'integration/core', bare]);
+    G(work, 'init', '-q', '-b', 'integration/core');
+    writeFileSync(join(work, 'a.txt'), 'one\n'); G(work, 'add', '.'); G(work, 'commit', '-qm', 'one');
+    const first = G(work, 'rev-parse', 'HEAD');
+    G(work, 'push', '-q', bare, 'integration/core');
+    const xdg = join(root, 'xdg');
+    mkdirSync(join(xdg, 'git'), { recursive: true });
+    writeFileSync(join(xdg, 'git', 'config'), `[url "${bare.replace(/\\/g, '/')}"]\n\tinsteadOf = ${URL_}\n`);
+    process.env.XDG_CONFIG_HOME = xdg;
+    const commit = (text, msg) => { writeFileSync(join(work, 'a.txt'), text); G(work, 'commit', '-qam', msg); G(work, 'push', '-q', bare, 'integration/core'); return G(work, 'rev-parse', 'HEAD'); };
+    return { root, bare, work, first, commit, tipOf: () => G(bare, 'rev-parse', 'refs/heads/integration/core') };
+  }
+  async function world(r, tip) {
+    const handout = { repo: { remote_name: 'origin', url: URL_, clone_folder: 'f0' }, checkpoint: { integration_branch: 'integration/core', integration_head: tip, merge_commits: [r.first] } };
+    const view = { id: 'cko_other1', status: 'rendered', target: 'other_pc', team: 'Team', scope: 'team', agents: [agentOf(handout, 0)] };
+    const hub = await stubHub(pki, view);
+    hub.state = 'submitted';
+    const base = mk(), home = join(base, 'home'), dest = join(base, 'dest'), claudeJson = join(base, 'claude.json');
+    mkdirSync(home, { recursive: true }); mkdirSync(dest);
+    writeFileSync(join(home, 'conclave.mjs'), '');
+    const hubKey = putHub(home, { hubId: 'hub-other', origin: hub.origin, caPem: pki.caPem, appKey: APP });
+    const section = readKeyFile(home).data.hubs[hubKey];
+    const d = addDestination(home, dest, 'Other PC').destination;
+    const cx = { home, hubKey, section, hub: connect(section).hub, auth: { Authorization: `Bearer ${APP}` }, claudeJson };
+    const order = { id: 'pca_other1', kind: 'restore', payload: { checkout_id: view.id, destination_id: d.id } };
+    return { hub, home, dest, cx, order, dir: join(dest, 'Proj', 'f0'), close: () => { for (const s of hub.sockets) s.destroy(); hub.server.close(); } };
+  }
+  const head = (dir) => G(dir, 'rev-parse', 'HEAD');
+
+  test('a PC with no clone waits for the approval, then clones from the remote at its tip; nothing is pushed', async () => {
+    const r = remote();
+    const tip = r.commit('two\n', 'two');
+    const w = await world(r, tip);
+    try {
+      const s = beginRestore(w.home, w.cx.hubKey, w.order);
+      const waiting = await runRestoreRaw(w.cx, s);
+      assert.equal(waiting.phase, 'waiting');
+      assert.match(waiting.note, /Waiting for the administrator to approve this PC/);
+      assert.equal(existsSync(w.dir), false, 'nothing is cloned before the approval');
+      assert.equal(w.hub.pickups, 0);
+      w.hub.state = 'approved';
+      const done = await runRestore(w.cx, s);
+      assert.equal(done.phase, 'done', JSON.stringify(done));
+      assert.equal(head(w.dir), tip, 'the agent folder is the clone, at the remote tip');
+      assert.equal(G(w.dir, 'symbolic-ref', '--short', 'HEAD'), 'integration/core');
+      assert.equal(G(w.dir, 'config', '--get', 'remote.origin.url'), URL_);
+      assert.equal(readFileSync(join(w.dir, 'a.txt'), 'utf8').replace(/\r/g, ''), 'two\n');
+      assert.equal(w.hub.pickups, 1); assert.equal(w.hub.confirms, 1);
+      assert.equal(r.tipOf(), tip, 'nothing was pushed to the remote');
+    } finally { w.close(); }
+  });
+
+  test('a PC with an older clean clone fetches and fast-forwards it to the remote tip; nothing is pushed', async () => {
+    const r = remote();
+    // The clone this PC already has, from before the new commits.
+    const base = mk(), stale = join(base, 'stale');
+    G(base, 'clone', '-q', URL_, stale);
+    assert.equal(head(stale), r.first);
+    const tip = r.commit('three\n', 'three');
+    const w = await world(r, tip);
+    try {
+      mkdirSync(dirname(w.dir), { recursive: true });
+      renameSync(stale, w.dir);
+      assert.equal(head(w.dir), r.first, 'behind the remote before the restore');
+      w.hub.state = 'approved';
+      const done = await runRestore(w.cx, beginRestore(w.home, w.cx.hubKey, w.order));
+      assert.equal(done.phase, 'done', JSON.stringify(done));
+      assert.equal(head(w.dir), tip, 'fast-forwarded to the remote tip');
+      assert.equal(G(w.dir, 'merge-base', '--is-ancestor', r.first, 'HEAD') === '', true, 'a fast-forward keeps the old commit in history');
+      assert.equal(readFileSync(join(w.dir, 'a.txt'), 'utf8').replace(/\r/g, ''), 'three\n');
+      assert.equal(G(w.dir, 'status', '--porcelain', '--untracked-files=no'), '', 'the clone is clean');
+      assert.equal(r.tipOf(), tip, 'nothing was pushed to the remote');
+    } finally { w.close(); }
+  });
 });

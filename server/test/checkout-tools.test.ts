@@ -377,6 +377,37 @@ describe('checkout_resume', () => {
     expect(ok(await lead('checkout_resume')).restored).toBe(true);
     expect(app.teams.team(t.teamId)!.status).toBe('running');
   });
+
+  it('reuse: a second key of the agent, and a login dated before render, are refused with their reason and audited; the moved key still resumes', async () => {
+    const t = await onboarded();
+    const id = await handIn(t);
+    expect((await api('POST', `/checkouts/${id}/render`, { target: 'same_user', rotate_agent_keys: false })).status).toBe(200);
+    const renderedAt = app.checkouts.checkout(id)!.rendered_at!;
+    await sleep(5);
+    // Another key of the same agent on the same PC, logged in after render: not the key the agent moved with.
+    const sys = { kind: 'system' as const, id: null };
+    const movedCred = app.teams.members(t.teamId).find((m) => m.agent_id === t.dev.id)!.credential_id!;
+    const second = app.keys.createSessionKey({ agentId: t.dev.id, label: 'second', machineId: t.pc }, sys);
+    app.keys.setRules(second.credential.policy_id, app.keys.rulesFor(movedCred).map(({ effect, actions, resource }) => ({ effect, actions, resource })), 'test', sys);
+    const other = await (await login(t.key, second.secret))('checkout_resume');
+    expect(code(other)).toBe('resume_refused');
+    expect(other.structuredContent.reason).toBe('other_credential');
+    expect(other.content.map((c) => c.text).join('\n')).toContain('the key this agent moved with');
+    // A login with the moved key whose token dates from before render (render ends those; this one was planted).
+    const late = await login(t.key, t.dev.secret);
+    const tokens = app.db.prepare('UPDATE session_tokens SET created_at=? WHERE session_credential_id=? AND created_at>=?').run(renderedAt - 1000, movedCred, renderedAt);
+    expect(Number(tokens.changes)).toBe(1);
+    const early = await late('checkout_resume');
+    expect(code(early)).toBe('resume_refused');
+    expect(early.structuredContent.reason).toBe('login_before_render');
+    const refused = auditOf('checkout.resume_refused').filter((a) => a.details.includes(t.dev.id) || a.target_id === id).map((a) => JSON.parse(a.details).reason);
+    expect(refused).toEqual(expect.arrayContaining(['other_credential', 'login_before_render']));
+    expect(app.checkouts.handouts(id).find((x) => x.agent_id === t.dev.id)!.status).not.toBe('resumed');
+    // Neither refusal used up the resume: a fresh login with the moved key resumes once.
+    const dev = await login(t.key, t.dev.secret);
+    expect(ok(await dev('checkout_resume')).restored).toBe(false);
+    expect(code(await dev('checkout_resume'))).not.toBe('ok');
+  });
 });
 
 describe('review fixes (C3)', () => {

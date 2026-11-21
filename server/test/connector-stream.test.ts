@@ -196,7 +196,7 @@ describe('delivery orders', () => {
     const pc = await newPc('dl-msgthru'), rcv = agentOn(pc.id, 'dl-recv'), other = app.keys.createAgent('dl-sender', null, sys).id;
     const room = app.messaging.createGroup('dl-room', other);
     app.messaging.addMember(room.id, rcv, 'member', null);
-    const send = (agentId: string | null, n: number) => app.messaging.insert({ roomId: room.id, agentId, credId: null, kind: agentId === null ? 'system' : 'text', body: 'hi ' + n, replyTo: null, clientMsgId: 'c' + n + Math.random() });
+    const send = (agentId: string | null, n: number) => app.messaging.insert({ roomId: room.id, agentId, credId: null, kind: agentId === null ? 'system' : 'text', body: '@dl-recv hi ' + n, replyTo: null, clientMsgId: 'c' + n + Math.random() });
     const orders = async () => (await cn('GET', '/orders', pc.key)).body.orders as { payload: { agent_id: string; agent_msg?: boolean } }[];
     send(null, 1);
     expect(await orders()).toHaveLength(1);
@@ -210,6 +210,53 @@ describe('delivery orders', () => {
     expect(await orders()).toHaveLength(0);
     send(null, 5); // and the operator still gets through
     expect(await orders()).toHaveLength(1);
+  });
+  describe('an agent message wakes only the agents it addresses', () => {
+    /** A room on one PC with three agents; `woken()` lists the agents whose new orders appeared since the last call. */
+    const setup = async (tag: string) => {
+      const pc = await newPc(`wk-${tag}`);
+      const [a, b, c] = ['ana', 'ben', 'cy'].map((l) => agentOn(pc.id, `${tag}-${l}`)) as [string, string, string];
+      const room = app.messaging.createGroup(`wk-${tag}`, a);
+      app.messaging.addMember(room.id, b, 'member', null);
+      app.messaging.addMember(room.id, c, 'member', null);
+      const say = (from: string | null, body: string, replyTo: string | null = null, roomId = room.id) =>
+        app.messaging.insert({ roomId, agentId: from, credId: null, kind: from === null ? 'system' : 'text', body, replyTo, clientMsgId: `c${Math.random()}` });
+      const woken = async () => ((await cn('GET', '/orders', pc.key)).body.orders as { payload: { agent_id: string } }[]).map((o) => o.payload.agent_id).sort();
+      return { a, b, c, room, say, woken, tag };
+    };
+    it('two agents chatting in a room wake nobody', async () => {
+      const r = await setup('chat');
+      r.say(r.a, 'shall we start?');
+      r.say(r.b, 'yes, starting now');
+      expect(await r.woken()).toEqual([]);
+      // The message is still there for the third member, unread at its next prompt.
+      expect(app.messaging.members(r.room.id).map((m) => m.agent_id)).toContain(r.c);
+    });
+    it('an @mention of a label wakes only that agent, in any letter case, never inside a longer word or label', async () => {
+      const r = await setup('men');
+      r.say(r.a, 'email@men-cy.org and @men-cyclist are not mentions');
+      expect(await r.woken()).toEqual([]);
+      r.say(r.a, 'over to you, @MEN-CY.');
+      expect(await r.woken()).toEqual([r.c]);
+    });
+    it('a reply wakes the author of the message replied to', async () => {
+      const r = await setup('rep');
+      const q = r.say(r.b, 'which file?');
+      expect(await r.woken()).toEqual([]);
+      r.say(r.a, 'plan.md', q.id);
+      expect(await r.woken()).toEqual([r.b]);
+    });
+    it('a direct message wakes the other agent, never the sender', async () => {
+      const r = await setup('dm');
+      const dm = app.messaging.ensureDirect(r.a, r.b);
+      r.say(r.a, 'a word in private', null, dm.id);
+      expect(await r.woken()).toEqual([r.b]);
+    });
+    it('an operator message still wakes every member', async () => {
+      const r = await setup('op');
+      r.say(null, 'Everyone: the deadline moved.');
+      expect(await r.woken()).toEqual([r.a, r.b, r.c].sort());
+    });
   });
   it('an admin cannot create a delivery order', async () => {
     const pc = await newPc('dl-admin');
@@ -357,15 +404,25 @@ describe('delivery reliability (docs/connector.md, "Delivery orders")', () => {
     } finally { s.cancel(); }
   });
 
-  it('a blocked task, an approved task, a plan request and an operator question wake the coordinator', async () => {
+  it('a blocked task, an approved task and a plan request wake the coordinator', async () => {
     const pc = await newPc('dr-coord'), agent = agentOn(pc.id, 'dr-coord-a');
-    for (const [n, k] of ['task_blocked', 'task_approved', 'plan_request', 'decision_asked'].entries()) {
+    for (const [n, k] of ['task_blocked', 'task_approved', 'plan_request'].entries()) {
       app.keys.notify(agent, k, 'x', { task: `task_dc${n}`, state: 'x' });
     }
     const [o] = await orders(pc);
-    expect(o!.payload.items.map((i: { notice: string }) => i.notice)).toEqual(['task_blocked', 'task_approved', 'plan_request', 'decision_asked']);
+    expect(o!.payload.items.map((i: { notice: string }) => i.notice)).toEqual(['task_blocked', 'task_approved', 'plan_request']);
     app.keys.notify(agent, 'replan_requested', 'x', {});
     expect(await orders(pc)).toHaveLength(0); // still no order for the others
+  });
+
+  it('notices that need no action wait for the next prompt: a question asked or answered, a task awaiting approval, a resume without work', async () => {
+    const pc = await newPc('dr-quiet'), agent = agentOn(pc.id, 'dr-quiet-a');
+    for (const k of ['decision_asked', 'decision_update', 'task_awaiting_approval', 'team_resumed_note']) app.keys.notify(agent, k, 'x', {});
+    expect(await orders(pc)).toHaveLength(0);
+    // A resume for a member with work still wakes it.
+    app.keys.notify(agent, 'team_resumed', 'x', {});
+    const [o] = await orders(pc);
+    expect(o!.payload.items.map((i: { notice: string }) => i.notice)).toEqual(['team_resumed']);
   });
 
   it("a delivery order's agent and reason are columns; the retention job prunes finished orders after 30 days and keeps an open disconnect", async () => {

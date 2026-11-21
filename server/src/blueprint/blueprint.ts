@@ -374,6 +374,8 @@ const ASK_ID = /^dec_[A-Za-z0-9]{4,}$/;
 /** What rule unclear_needs_ask asks for, in words: the question itself, or the id of an open one naming the item. */
 const unclearHow = (key: string) => `Put your question to the operator in unclear_ask, as its text or as {question, options, recommended}, and the write asks it for you, naming ${key}. Or give the id of an open team_ask of your team that names ${key} in refs.`;
 
+/** A decision item read as a design: who wrote it and who last changed its review come from its revisions. */
+export interface Design { item: Item; project_id: string; written_by: { kind: string; id: string | null } | null; reviewed_by: { kind: string; id: string | null; at: number } | null; stale: boolean }
 export class Blueprint {
   limits: BpLimits;
   deps: BpDeps = {};
@@ -2613,14 +2615,16 @@ export class Blueprint {
    * A team_ask answer (§4): a `proposed` decision named in its refs is accepted with the answer; otherwise, when the
    * agent asked with `decision: true`, a new accepted ADR records it and governs the refs it can. Returns the ADR key.
    */
-  recordDecision(d: AskAnswer, actor: BpActor): string | null {
+  recordDecision(d: AskAnswer, actor: BpActor, rejected?: { reason: string }): string | null {
     const p = this.projectOfTeam(d.team_id);
     if (!p) return null;
     const settled = { chosen: [d.answer_label, d.answer_text].filter(Boolean).join(' — ').slice(0, 1000), decided_at: d.answered_at ?? Date.now(), decided_by: 'operator', source: `team_ask:${d.id}` };
     return atomic(this.db, () => {
       const adr = d.refs.map((k) => this.liveRow(p.id, k)).find((r) => r?.kind === 'decision' && r.status === 'proposed');
       if (adr) {
-        this.apply(p.id, [{ op: 'upsert', kind: 'decision', key: adr.key, status: 'accepted', fields: settled }], actor, { note: `answered ${d.id}`, teamId: d.team_id });
+        // A rejected design: the decision is recorded as rejected, with the operator's reason as its consequence.
+        const to = rejected ? { status: 'rejected', fields: { ...settled, chosen: 'Rejected', consequences: rejected.reason.slice(0, 2000) } } : { status: 'accepted', fields: settled };
+        this.apply(p.id, [{ op: 'upsert', kind: 'decision', key: adr.key, status: to.status, fields: to.fields }], actor, { note: `${rejected ? 'rejected' : 'answered'} ${d.id}`, teamId: d.team_id });
         return adr.key;
       }
       if (!d.make_decision) return null;
@@ -2633,6 +2637,43 @@ export class Blueprint {
       if (governs.length) this.apply(p.id, governs, actor, { note: `answered ${d.id}`, teamId: d.team_id });
       return key;
     });
+  }
+
+  /**
+   * The design a decision question asks about (docs/decisions.md, Designs): the first decision item its refs name (live, any status),
+   * with its body, the review and who wrote it. Null when the question names none.
+   */
+  designOf(teamId: string, refs: string[]): Design | null {
+    const p = this.projectOfTeam(teamId);
+    if (!p) return null;
+    for (const k of refs) { const d = this.designAt(p.id, k); if (d) return d; }
+    return null;
+  }
+  /** The decision item with this key as a design (archived or not), or null when the key is not a live decision. */
+  designAt(projectId: string, key: string): Design | null {
+    const r = this.liveRow(projectId, key);
+    if (r?.kind !== 'decision') return null;
+    const item = toItem(r);
+    // Revisions, oldest first: the writer is who made the first one; the reviewer is who last changed the review field.
+    const revs = this.revisions(r.id).slice().reverse();
+    let reviewed: { kind: string; id: string | null; at: number } | null = null, prev = 'null', atReview: string | null = null;
+    // What the reviewer read: the title, body, options and mockups of the revision that set the review.
+    const content = (snap: Record<string, unknown>): string => { const f = (snap['fields'] as Record<string, unknown> | undefined) ?? {}; return JSON.stringify([snap['title'] ?? null, snap['body'] ?? null, f['options'] ?? null, f['mockups'] ?? null]); };
+    let stale = false;
+    for (const v of revs) {
+      const now = JSON.stringify(((v.snapshot['fields'] as Record<string, unknown> | undefined) ?? {})['review'] ?? null);
+      if (now !== prev && now !== 'null') { reviewed = { kind: v.actor_kind, id: v.actor_id, at: v.at }; atReview = content(v.snapshot); stale = false; }
+      else if (atReview !== null && content(v.snapshot) !== atReview) stale = true;
+      prev = now;
+    }
+    return { item, project_id: projectId, written_by: revs[0] ? { kind: revs[0].actor_kind, id: revs[0].actor_id } : null, reviewed_by: reviewed, stale: !!reviewed && stale };
+  }
+  /** The designs of a project for the Blueprint filter: decision items that are designs (proposed, asked about, reviewed or with mockups), archived ones too. */
+  designs(projectId: string): Design[] {
+    const rows = this.db.prepare("SELECT key FROM bp_items WHERE project_id=? AND kind='decision' AND deleted_at IS NULL ORDER BY created_at DESC, key DESC").all(projectId) as { key: string }[];
+    // A decision a team asked the operator about is a design too, reviewed or not.
+    const asked = new Set<string>(); for (const q of this.db.prepare('SELECT d.refs, d.bp_key FROM decisions d JOIN teams t ON t.id=d.team_id WHERE t.project_id=?').all(projectId) as { refs: string; bp_key: string | null }[]) { if (q.bp_key) asked.add(q.bp_key); try { for (const k of JSON.parse(q.refs) as string[]) asked.add(k); } catch { /* a malformed refs list names nothing */ } }
+    return rows.map((r) => this.designAt(projectId, r.key)).filter((d): d is Design => !!d && (d.item.status === 'proposed' || asked.has(d.item.key) || !!d.item.fields['review'] || (Array.isArray(d.item.fields['mockups']) && (d.item.fields['mockups'] as unknown[]).length > 0)));
   }
 
   /**

@@ -160,6 +160,7 @@ const kv = (label, valueHtml, { id = false } = {}) => `<div class="kv"><span cla
 /* A danger-zone row: icon, title and what it does on the left, its button on the right. */
 const dz = (icon, title, meta, btn) => row({ lead: ic(icon), title, meta, trail: btn });
 /* Card header row (§5 Card): the title (--t-title) left, meta or one action (trusted markup) right. */
+let keyMore = false; // the key card's Details fold stays as the person left it when the card redraws
 const kd = (title, right = '') => `<div class="kd-h"><h3>${esc(title)}</h3>${right}</div>`;
 /* Section label inside a card: "ACTIVE · 7". extra is trusted markup after the label, for example an info() button. */
 const overline = (text, count, extra = '') => `<div class="overline"><span>${esc(text)}</span>${count === undefined || count === null ? '' : `<span aria-hidden="true">·</span><span>${esc(count)}</span>`}${extra}</div>`;
@@ -2287,7 +2288,8 @@ const muCanWrite = (p) => { const r = muRel(p).toLowerCase(); return !!MU.me?.fo
    project when there is one project grant with one team and no folder grant, Vault with folder grants only, else Home. */
 async function muLanding() {
   const me = MU.me, P = me.grants.length, F = (me.folder_grants || []).length;
-  if ((await dlgMine()).length) return ''; // an agent lent to them waits on Home: it is not hidden behind a single project
+  if ((await dlgMine()).length) return ''; // an agent lent to them waits on Home: not hidden behind a single project
+  if ((await invMine()).length) return ''; // so does an invite
   if (!P && F) return 'vault';
   if (P === 1 && !F) { await muLoadCommon(); const p = MU.projects[0]; if (p && p.teams.length === 1) return 'p/' + p.id; }
   return '';
@@ -2328,6 +2330,7 @@ const muInP = (pid) => (r) => !pid || r.scope.project_id === pid;
 function muNyOpen(o) {
   const p = o.project_id || (o.team_id ? muProjOf(o.team_id)?.id : null);
   if (o.kind === 'question') return `data-mu-go="dec|${esc(o.id)}"`;
+  if (o.kind === 'design') return `data-design="${esc(o.id)}"`;
   if (o.kind === 'proposal') return `data-mu-act="review|${esc(o.project_id)}|${esc(o.id)}"`;
   // An item opens its own page (the row names its project). A stalled agent has no member page: Open goes to its project,
   // so not on that project's page.
@@ -2437,10 +2440,11 @@ const MU_PAGES = {
     const sums = await muSums(P);
     // Left: the project cards, then Teams under them; right: Papers, then Work in motion. On a phone the columns stack in that order.
     const teams = T.length && muAny('tasks') ? `<div class="card kd-card">${kd('Teams')}${T.map((t) => row({ one: false, lead: `<span class="tm-ico">${ic('team')}</span>`, title: t.name, meta: muTeamMeta(t) })).join('')}</div>` : '';
-    const left = (P.map((p, i) => muProjCard(p, sums[i])).join('') || `<div class="card">${none('proj', 'No projects yet. The admin adds the projects you see.')}</div>`) + teams;
+    const left = (P.map((p, i) => muProjCard(p, sums[i])).join('') || `<div class="card">${none('proj', 'No projects yet. The operator adds the projects you see.')}</div>`) + teams;
     const right = muPapersCard(P, true) + (feed ? `<div class="card kd-card">${kd('Work in motion')}${muFeed(feed.events, 6)}</div>` : '');
     const dm = dlgMemberHtml(await dlgMine());
-    return muPage('Home', `${dm}<div class="kd-grid mu-grid"><div class="kd-col">${left}</div><div class="kd-col">${right}</div></div>`);
+    const im = invMemberHtml(await invMine());
+    return muPage('Home', `${dm}${im}<div class="kd-grid mu-grid"><div class="kd-col">${left}</div><div class="kd-col">${right}</div></div>`);
   },
   async projects() {
     await muLoadCommon();
@@ -2889,6 +2893,7 @@ function muInit() {
     // Back on an item page follows the history (Back from a claim returns to its paper).
     const g = t.closest('[data-mu-go]'); if (g) { e.preventDefault(); const s = g.dataset.muGo, i = s.indexOf('|'); if (s === 'back') { history.back(); return; } muGo(i < 0 ? s : s.slice(0, i), i < 0 ? '' : s.slice(i + 1)); return; }
     const dm = t.closest('[data-dlg-mu]'); if (dm) { run(() => dlgMemberAct(dm.dataset.dlgMu, dm.dataset.id)); return; }
+    const im = t.closest('[data-inv-mu]'); if (im) { run(() => invMemberAct(im.dataset.id)); return; }
     const dl = t.closest('[data-mu-dl]'); if (dl) { download(dl.dataset.muDl); return; }
     const it = t.closest('[data-mu-item]'); if (it) { const pid = it.dataset.muPid || (MU.view === 'p' ? MU.arg.split('/')[0] : ''); if (pid) muOpenItem(pid, it.dataset.muItem); return; }
     // On an item page (the shared item screen): an item link or a defined code opens the next item page, a vault note the
@@ -2897,6 +2902,7 @@ function muInit() {
     const vf = t.closest('[data-vf]'); if (vf) { e.preventDefault(); e.stopPropagation(); muGo('file', vf.dataset.vf); return; }
     const tk = t.closest('[data-mu-task]'); if (tk) { const pid = MU.view === 'p' ? MU.arg.split('/')[0] : ''; if (pid) run(() => muTask(pid, tk.dataset.muTask)); return; }
     const mo = t.closest('[data-mu-more]'); if (mo) { const rest = mo.previousElementSibling; if (rest?.classList.contains('mu-rest')) { rest.hidden = false; rest.querySelector('button')?.focus({ preventScroll: true }); } mo.remove(); return; }
+    const dsg = t.closest('[data-design]'); if (dsg) { run(() => designOpen(dsg.dataset.design)); return; }
     const ny = t.closest('[data-mu-ny]'); if (ny) { nyAct(ny, ny.dataset.muNy, () => muDraw(false)); return; }
     const nyd = t.closest('[data-mu-ny-dis]'); if (nyd) { nyDismiss(nyd, nyd.dataset.muNyDis, () => muDraw(false)); return; }
     const nyl = t.closest('[data-mu-ny-later]'); if (nyl) { nyLater(nyl, nyl.dataset.muNyLater, () => muDraw(false)); return; }
@@ -3657,7 +3663,7 @@ const ROUTE_OK = {
   plan: (a) => { const [i, k = 'req', f = ''] = a.split('|'); return RID.test(i) && ['req', 'ms', 'sum'].includes(k) && (/^[a-z]*$/.test(f) || BP_KEY.test(f)); }, room: (a) => RID.test(a), share: (a) => RID.test(a), app: (a) => !a || RID.test(a),
   task: (a) => { const p = a.split('|'); return p.length === 2 && p.every((x) => RID.test(x)); },
   hardware: (a) => !a, hwm: (a) => RID.test(a),
-  relays: (a) => !a,
+  relays: (a) => !a, db: (a) => !a,
   needs: (a) => !a || a.split('&').every((x) => /^s=(aw|later)$/.test(x) || (/^(team|project)=/.test(x) && RID.test(x.slice(x.indexOf('=') + 1)))),
   feedback: (a) => ['', 'new', 'open', 'closed'].includes(a), fbr: (a) => RID.test(a),
   directive: (a) => { const [i, k] = dirAgSplit(a); return RID.test(i) && dirAgOk(k); }, directives: (a) => !!dirArgs(a), teams: (a) => !!tmArgs(a) || !!tmTopo(a), home: tmArgs, topology: (a) => { const t = tzArg(a); return !t.f || TM_FOCUS.test(t.f); },
@@ -3693,7 +3699,7 @@ const ROUTES = {
   // Root tabs: Work, Security, Vault, Audit, and the rail's own screens.
   home: navRoot('Home'), topology: navRoot('Topology'), sessions: navRoot('Sessions'), chats: navRoot('Chats'), feedback: navRoot('Feedback'), directives: navRoot('Directives'),
   keys: navRoot('Keys'), pcs: navRoot('PCs'), hardware: navRoot('Hardware'), users: navRoot('Users'), req: navRoot('Requests'), shares: navRoot('Shares'), grant: navRoot('Agent access'), reset: navRoot('Reset'),
-  relays: navRoot('Relays'),
+  relays: navRoot('Relays'), db: navRoot('Database'),
   vault: navRoot('Vault'), knowledge: navRoot('Knowledge'), vreaders: navRoot('Vault readers'), log: { parent: () => null, label: (a) => LOG_TABS[navArg0(a) || 'audit'] || 'Audit' },
   account: navRoot('Account'), shortcuts: navRoot('Shortcuts'),
   // Work, under Home.
@@ -3890,7 +3896,7 @@ function closeD() {
   lastFocus && lastFocus.focus && lastFocus.isConnected && lastFocus.focus({ preventScroll: true });
   lastFocus = null;
 }
-const TAB_BAR = { relays: '#securityBar', knowledge: '#vaultBar', vreaders: '#vaultBar', keys: '#securityBar', pcs: '#securityBar', hardware: '#securityBar', hwm: '#securityBar', req: '#securityBar', shares: '#securityBar', grant: '#securityBar', reset: '#securityBar', sessions: '#agentsBar', topology: '#agentsBar', chats: '#agentsBar', feedback: '#agentsBar', log: '#auditBar' };
+const TAB_BAR = { relays: '#securityBar', db: '#securityBar', knowledge: '#vaultBar', vreaders: '#vaultBar', keys: '#securityBar', pcs: '#securityBar', hardware: '#securityBar', hwm: '#securityBar', req: '#securityBar', shares: '#securityBar', grant: '#securityBar', reset: '#securityBar', sessions: '#agentsBar', topology: '#agentsBar', chats: '#agentsBar', feedback: '#agentsBar', log: '#auditBar' };
 const clearBarActions = () => $$('.ws-act,.ws-tools').forEach((x) => x.remove());
 const SECTION_BARS = { security: '#securityBar', agents: '#agentsBar', vault: '#vaultBar', log: '#auditBar' };
 /* The section tab bar a screen shows (navOn's rule): its area's, except inside a team, which has none. */
@@ -3927,7 +3933,7 @@ function tabTitle() {
 }
 /* The area a screen belongs to; the rail, the bottom nav and the bar titles all follow it (detail screens included). */
 const AREA = {
-  security: ['security', 'keys', 'key', 'new', 'app', 'pcs', 'pc', 'hardware', 'hwm', 'req', 'shares', 'share', 'grant', 'reset', 'lock', 'relays'],
+  security: ['security', 'keys', 'key', 'new', 'app', 'pcs', 'pc', 'hardware', 'hwm', 'req', 'shares', 'share', 'grant', 'reset', 'lock', 'relays', 'db'],
   agents: ['home', 'needs', 'monitoring', 'work', 'agents', 'topology', 'sessions', 'chats', 'team', 'task', 'tstatus', 'blueprint', 'bp', 'tasks', 'members', 'tsettings', 'tbuild', 'room', 'ses', 'feedback', 'fbr', 'dec', 'decisions', 'directives', 'directive', 'ob', 'tdirs', 'tdir', 'tchats', 'tses', 'backlog', 'rules'],
   vault: ['vault', 'diff', 'knowledge', 'vreaders'],
   log: ['log'],
@@ -3938,7 +3944,7 @@ for (const [t, ar, team] of ADM_NAV) { AREA[ar].push(t); if (team) TEAM_SCREENS.
 const areaOf = (t) => Object.keys(AREA).find((a) => AREA[a].includes(t)) || null;
 const AREA_TITLE = { agents: 'Work', vault: 'Vault', security: 'Security', log: 'Audit' };
 function navOn(t, arg, ctx = false) {
-  const securityTab = { keys: 'keys', key: 'keys', pcs: 'pcs', pc: 'pcs', hardware: 'hardware', hwm: 'hardware', req: 'req', shares: 'shares', share: 'shares', grant: 'grant', new: 'grant', app: 'grant', tpls: 'grant', tplnew: 'grant', reset: 'reset', relays: 'relays', users: 'users', user: 'users' }[t];
+  const securityTab = { keys: 'keys', key: 'keys', pcs: 'pcs', pc: 'pcs', hardware: 'hardware', hwm: 'hardware', req: 'req', shares: 'shares', share: 'shares', grant: 'grant', new: 'grant', app: 'grant', tpls: 'grant', tplnew: 'grant', reset: 'reset', relays: 'relays', db: 'db', users: 'users', user: 'users' }[t];
   // Home is Work's first tab: the overview (no screen open) and #home both light it, and so do the team screens, which hang under Home.
   const agentTab = { home: 'home', monitoring: 'home', sessions: 'sessions', ses: 'sessions', topology: 'topology', team: 'home', tasks: 'home', members: 'home', tsettings: 'home', rules: 'home', tbuild: 'home', chats: 'chats', room: 'chats', feedback: 'feedback', fbr: 'feedback', dec: 'home', decisions: 'home', directives: 'directives', directive: 'directives', ob: 'home', backlog: 'home', work: 'home', needs: 'home' }[t || 'home'];
   const area = t ? areaOf(t) : 'agents';
@@ -4416,7 +4422,7 @@ const VIEWS = {
     const doSus = () => act(() => post(`${kp}/suspend`), 'Suspended');
     const doRe = () => act(() => post(`${kp}/reactivate`), 'Resumed');
     const doEnd = () => act(() => post(`${kp}/end-logins`), 'Ended');
-    const doRev = () => act(() => post(`${kp}/revoke`), 'Revoked');
+    const doRev = () => act(() => post(`${kp}/revoke`), `Key revoked: ${keyName(k)}`);
     // Rotate secret and Make a new prompt are one act (POST /rotate); the reissue says that the old prompt stops working.
     const doRot = (note) => run(async () => { const r = await post(`${kp}/rotate`); refresh(); if (r.handover) { toast(`Sent: waiting for the user of ${r.handover.pc.name}`); return openD('key', r.key.id, true); } const v =secretView(r, keyName(k), typeof note === 'string' ? note : ''); $('#dT').innerHTML = v.t; $('#dB').innerHTML = v.b; v.after(); });
     const doNew = () => doRot('A new prompt was made. The old prompt and its key stop working.');
@@ -4557,22 +4563,24 @@ const VIEWS = {
     const pcLink = (pc) => `<a href="#" class="mono" data-pc="${esc(pc.id)}" title="Open PC ${esc(pc.name)}">${esc(pc.name)}</a>`;
     // The binding switch: on binds the key to the PC it logs in through (or one picked in the sheet), off frees it.
     const bindLabel = k.bound_pc ? `Use only from ${k.bound_pc.name}` : via?.pc ? `Use only from ${via.pc.name}` : 'Use only from one PC';
+    // At a glance: whose key, which PC it reaches, its state, when it was last used. The rest sits one level down, under Details.
     const idCard = `<div class="pcard kvc kd-card">${kd('What this key is')}
-      ${kv('Kind', `${keyKind(k)}${info(isApp ? 'Lets a client on one PC connect. Agents log in through it with their session keys.' : 'Identifies one agent. It logs in through an app key on a PC.')}`)}
       ${isApp ? `${k.pc ? kv('PC', pcLink(k.pc)) : ''}${kv('App', esc(k.app_name || k.label))}`
-        : `${k.agent ? kv('Agent', `<a href="#" data-ses="${esc(k.agent.id)}" title="Open agent ${esc(k.agent.label)}">${esc(k.agent.label)}</a>${k.agent.role ? `<span class="kv-sub"> · ${esc(k.agent.role)}</span>` : ''}`) : ''}
-          ${kv('Logs in through', via ? `${via.pc ? pcLink(via.pc) : ''}<span class="kv-sub"><span class="only-d"> · ${esc(via.app_name || via.label)}</span>${viaAt ? ' · ' + ago(viaAt) + ' ago' : ''}</span>` : '<span class="kv-sub">No login in the last hour</span>')}`}
+        : k.agent ? kv('Agent', `<a href="#" data-ses="${esc(k.agent.id)}" title="Open agent ${esc(k.agent.label)}">${esc(k.agent.label)}</a>${k.agent.role ? `<span class="kv-sub"> · ${esc(k.agent.role)}</span>` : ''}`) : ''}
       ${isApp ? '' : kv('PC binding', `<span class="kv-trunc" title="${esc(bindText)}">${esc(bindText)}</span>${dead ? '' : `${k.bound_pc ? '<button type="button" class="btn ghost sm" id="kBind" aria-haspopup="dialog">Change PC</button>' : ''}${switchBtn(bindLabel, !!k.bound_pc, 'id="kBindSw"')}`}`)}
+      ${kv('Status',`${pill(k)}<span class="kv-sub"> · ${live} of ${k.max_live_sessions} live logins</span>${canNew ? '<button type="button" class="btn ghost sm" id="kNew" title="The key never logged in: make a fresh prompt. The old one stops working.">Make a new prompt</button>' : ''}`)}
+      ${kv('Last used', esc(k.last_used_at ? ago(k.last_used_at) + ' ago' : 'Never'))}
+      <details class="kd-more" id="kMore"${keyMore ? ' open' : ''}><summary>Details</summary>
+      ${kv('Kind', `${keyKind(k)}${info(isApp ? 'Lets a client on one PC connect. Agents log in through it with their session keys.' : 'Identifies one agent. It logs in through an app key on a PC.')}`)}
+      ${isApp ? '' : kv('Logs in through', via ? `${via.pc ? pcLink(via.pc) : ''}<span class="kv-sub"><span class="only-d"> · ${esc(via.app_name || via.label)}</span>${viaAt ? ' · ' + ago(viaAt) + ' ago' : ''}</span>` : '<span class="kv-sub">No login in the last hour</span>')}
       ${admOnbKv(k, dead)}
-      ${kv('Status', `${pill(k)}<span class="kv-sub"> · ${live} of ${k.max_live_sessions} live logins</span>${canNew ? '<button type="button" class="btn ghost sm" id="kNew" title="The key never logged in: make a fresh prompt. The old one stops working.">Make a new prompt</button>' : ''}`)}
       ${isApp ? kv('Login limit', `${k.max_live_sessions}<span class="kv-sub"> live logins at most</span>${dead ? '' : '<button type="button" class="btn ghost sm" id="kLim" aria-haspopup="dialog">Change limit</button>'}`) : ''}
       ${kv('Created', `${dt(k.created_at)}<span class="kv-sub"> · ${k.first_used_at ? 'first used ' + dt(k.first_used_at) : 'never used'}</span>`)}
-      ${kv('Last used', esc(k.last_used_at ? ago(k.last_used_at) + ' ago' : 'Never'))}
       ${kv('Expires', `${esc(expText)}${dead ? '' : `<button type="button" class="btn ghost sm" id="kExp" aria-haspopup="dialog">Change expiry</button>`}`)}
       ${k.revoked_at ? kv('Revoked', dt(k.revoked_at)) : ''}
       ${k.replaces_credential_id ? kv('Replaces', K(k.replaces_credential_id) ? `<a href="#" data-key="${esc(k.replaces_credential_id)}">${esc(keyName(K(k.replaces_credential_id)))}</a>` : '<span class="kv-sub">A removed key</span>') : ''}
       ${keyMoved(k).by ? kv('Moved by', esc(cap(keyMoved(k).by))) : ''}
-      ${kv('Key id', esc(k.masked_key), { id: true })}</div>`;
+      ${kv('Key id', esc(k.masked_key), { id: true })}</details></div>`;
     // What it may do: one row per editing tab, each with a summary and the tab it opens.
     // Read comes from the effective access (templates and app key included); write from the key's own folder rules, the grid the Access tab edits.
     const fAll = [ef.root, ...ef.folders].filter(Boolean), fRead = fAll.filter((f) => f.read).length;
@@ -4667,7 +4675,7 @@ const VIEWS = {
         menu: dead ? [] : [isApp ? { label: 'Rotate secret', icon: 'rot', confirm: 'Tap again: the old secret stops', fn: doRot } : { label: 'Rotate secret', icon: 'rot', fn: () => openRotate(null) },
           k.live_logins ? { label: 'End logins', icon: 'out', fn: doEnd } : null,
           k.effective_status === 'active' ? { label: 'Suspend key', icon: 'pause', confirm: 'Tap again: logins refused until resumed', fn: doSus } : k.effective_status === 'suspended' && !held ? { label: 'Resume key', icon: 'play', fn: doRe } : null,
-          { label: 'Revoke key', icon: 'trash', bad: true, confirm: 'Tap again: permanent, logins stop', fn: doRev }] },
+          { label: 'Revoke key', icon: 'trash', bad: true, confirm: 'Revoke? Logins stop for good', fn: doRev }] },
       after() {
         $$('[data-key-tab]').forEach((b) => (b.onclick = () => {
           keyTab = b.dataset.keyTab; setRoute('key', id + '|' + keyTab);
@@ -4681,7 +4689,7 @@ const VIEWS = {
         on('#kSus', doSus);
         on('#kRe', doRe);
         on('#kEnd', doEnd);
-        if ($('#kRev')) arm($('#kRev'), doRev, 'Yes, revoke');
+        if ($('#kRev')) arm($('#kRev'), doRev, isApp ? 'Revoke? No agent logs in through it' : 'Revoke? The agent can no longer log in');
         if ($('#kRot')) { if (isApp) arm($('#kRot'), doRot, 'Yes, rotate'); else on('#kRot', (e) => openRotate(e.currentTarget)); }
         if ($('#hCancel')) arm($('#hCancel'), () => act(() => post(`${kp}/handover/cancel`), held ? 'Cancelled: the key stays held' : 'Cancelled: the current key goes on working'), 'Yes, cancel');
         if ($('#hRot')) on('#hRot', (e) => openRotate(e.currentTarget));
@@ -4694,6 +4702,7 @@ const VIEWS = {
             if (n && (n.handover?.id !== oh.id || n.handover?.picked_up !== oh.picked_up)) { clearInterval(timer); openD('key', id, true); }
           }, 15000);
         }
+        $('#kMore')?.addEventListener('toggle', (e) => { keyMore = e.currentTarget.open; });
         if ($('#kNew')) arm($('#kNew'), doNew, 'Yes, the old prompt stops');
         // Expiry: the existing period control, in a sheet.
         on('#kExp', (e) => {
@@ -5998,7 +6007,7 @@ VIEWS.pc = async (id) => {
     ${kv('Description', p.description ? `<span title="${esc(p.description)}">${esc(p.description)}</span>` : '<span class="kv-sub">None</span>')}
     ${obE || obAll.length ? kv('Onboarding', `${obPcH(p)}${obE?.status === 'unused' ? `<button type="button" class="btn ghost sm" id="pcCodeX" title="The prompt's code stops working; Re-enrol PC makes a new one">Revoke code</button>` : ''}`) : ''}
     ${pcHasBridge(p) || cn.status === 'never' ? kv('Bridge', `${pcBridgeH(p)}${br.paired ? '' : `<button type="button" class="btn ghost sm" id="pcSetup" title="Create a one-hour setup message to paste into an app on this PC">Set up bridge</button>`}`) : ''}
-    ${br.os || br.version ? kv('System', esc([br.os, br.version && 'bridge ' + br.version].filter(Boolean).join(' · '))) : ''}
+    ${br.os || br.version ? kv('System', esc([br.os, br.version && (cn.status !== 'never' ? null : 'bridge ' + br.version)].filter(Boolean).join(' · '))) : ''}
     ${kv('Added', dt(p.created_at))}
     ${su ? `<div class="pc-setup">${overline('Setup message')}${codeBox(su.message)}<span class="tag self-start">${ic('clock')} ${Math.max(0, Math.round((su.exp - Date.now()) / 60000))}m left</span></div>` : ''}</div>`;
   const tA = tl?.agents || [], inTl = new Set(tA.map((a) => a.agent_id).filter(Boolean));
@@ -6018,7 +6027,7 @@ VIEWS.pc = async (id) => {
     ${kv('Node', cnV(cn.node))}${kv('git', cnV(cn.git))}
     ${kv('Clients', cn.clients?.length ? cn.clients.map((c) => `${esc(CN_CLIENT[c.client] || c.client)} ${cnV(c.version)}`).join(' · ') : CN_UNK)}
     ${kv('Auto-update', cnSw(cn.auto_update))}${kv('Remote cleanup', cnSw(cn.remote_cleanup))}
-    ${kv('Old setup', cn.legacy_leftovers === true ? `${pill('Left on this PC', 'warn')}<span class="kv-sub"> · its user clears it with <span class="mono">conclave migrate --finish --remove-legacy-ca</span></span>` : cn.legacy_leftovers === false ? 'Cleared' : CN_UNK)}
+    ${kv('Old setup', cn.legacy_leftovers === true ? `${pill('Left on this PC', 'warn')}${leftoverText(cn.legacy_leftover_kinds) ? `<span class="kv-sub"> · ${esc(leftoverText(cn.legacy_leftover_kinds))}</span>` : ''}<span class="kv-sub"> · on that PC, <span class="mono">conclave check</span> says what is left and how to clear it</span>` : cn.legacy_leftovers === false ? 'Cleared' : CN_UNK)}
     ${kv('Isolation', cn.isolation ? `${esc(CN_ISO[cn.isolation] || cn.isolation)}<span class="kv-sub"> · ${esc(CN_KEYSTORE[cn.key_store] || 'key store unknown')}</span>` : CN_UNK)}${verRow}</div>`;
   const tlCard = tl ? `<div class="pcard kd-card">${kd('Setup', info('Each step of setting up this PC. A step that waits says what happens next and who does it.'))}<ol class="cn-tl">${tl.steps.map(cnStepH).join('')}</ol></div>` : '';
   // PC actions: stored on the hub, fetched by the connector on its next call.
@@ -6057,7 +6066,7 @@ VIEWS.pc = async (id) => {
       return row({ one: true, lead: `<span class="fi-${m[1]}" title="${m[2]}">${ic(m[0])}</span>`, title: raw(`<span class="mono" title="${esc(f.path)}">${esc(midTrunc(f.path, 40))}</span>`),
         trail: f.status === 'proposed' ? `<button type="button" class="btn sm" data-fd="approve" data-path="${esc(f.path)}">Approve</button><button type="button" class="btn sm" data-fd="reject" data-path="${esc(f.path)}">Reject</button>` : `<span>${m[2]}</span>` }); }).join('')}</div>` : '';
   const dangerCard = `<div class="pcard kd-card kd-danger only-d">${kd('Danger zone')}
-    ${dz('rot', 'Re-enrol PC', 'New prompt and app key. With the connector, the agents\' keys are handed over; else they are revoked now.', '<button type="button" class="btn sm" id="pcReEnrol">Re-enrol PC</button>')}
+    ${dz('rot', 'Re-enrol PC', 'New code and app key. With the connector, the agents\' keys are handed over; else they are revoked now.', '<button type="button" class="btn sm" id="pcReEnrol">Re-enrol PC</button>')}
     ${dscOpen ? '' : dz('out', 'Disconnect this hub from this PC', 'Revokes its access now; its connector then removes this hub from the PC. Repositories and chats stay.', '<button type="button" class="btn sm" id="pcDisc">Disconnect</button>')}</div>
     <p class="hint only-m kd-hint">Re-enrol PC and Disconnect are in ⋯.</p>`;
   return {
@@ -6082,7 +6091,7 @@ VIEWS.pc = async (id) => {
       if ($('#pcDisc')) $('#pcDisc').onclick = () => pcDisconnectSheet(p, cn, re);
       $$('[data-ver]').forEach((b) => { if (b.dataset.ver === 'refuse') arm(b, () => doVer(b.dataset.v, 'refuse'), 'Yes, refuse'); else b.onclick = () => doVer(b.dataset.v, 'approve'); });
       arm($('#pcReEnrol'), () => run(() => obReEnrol(p)), 'Yes, revoke its keys now');
-      if ($('#pcCodeX')) arm($('#pcCodeX'), () => run(async () => { await api(`/pcs/${p.id}/enrolment`, 'DELETE'); toast('Code revoked'); re(); }), 'Yes, revoke');
+      if ($('#pcCodeX')) arm($('#pcCodeX'), () => run(async () => { await api(`/pcs/${p.id}/enrolment`, 'DELETE'); toast(`Code revoked for ${p.name}`); re(); }), 'Revoke? The code stops working');
       $$('[data-fd]').forEach((b) => (b.onclick = () => run(async () => { await post(`/pcs/${p.id}/folders/${encodeURIComponent(b.dataset.path)}/${b.dataset.fd}`); re(); })));
       $$('[data-more]').forEach((b) => (b.onclick = () => { const box = $('#' + b.dataset.more), all = box.classList.toggle('all'); b.setAttribute('aria-expanded', String(all)); b.querySelector('.lrow-title').textContent = all ? 'Show fewer' : `Show all ${agAll.length} agents`; }));
     },
@@ -6113,26 +6122,20 @@ const obPcH = (p) => { const s = obPcLabel(p); return !s ? '<span class="faint">
 
 /* The hub the PC pairs with, beside its prompt: the hub's own origin, or the relay's when the code was made through one. */
 const obHubFacts = (pairing) => `<div class="ob-kv">${kv('Hub', `<span class="mono">${esc(pairing?.hub_origin || S.me?.public_url || '')}</span>`)}${pairing?.relay ? kv('Through relay', esc(pairing.relay.name)) : ''}</div>`;
-/* The connector's pairing step. The code and the hub check go into the connector's own pairing screen, never into a chat; the
-   connector checks the hub's certificate against the hub check before it sends the code. */
-const obPairH = (r, step = '') => {
-  const p = r.pairing, exp = p.code_expires_at;
-  return `<div class="jn-dl ob-pair">${ic('pc')}<span>${step}On <b>${esc(r.pc.name)}</b>, open the connector's pairing screen and enter the code <code class="ob-chip">${esc(p.code)}</code> and the hub check <code class="ob-chip">${esc(p.ca_check)}</code>. The code works once and it is valid for 30 minutes${exp ? `, until ${esc(new Date(exp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}` : ''}; <b>Re-enrol PC</b> on the PC's page makes a new one.</span></div>`;
-};
+/* The line above the one prompt (docs/onboarding.md, "The prompt"): who it goes to and how, and the code's life. The prompt
+   carries the single-use pairing code; it works once, for 30 minutes, and only with this hub. Give it to the PC's user
+   directly, never through a shared chat. New prompt makes a new code and voids this one. */
+const obCodeLife = (r) => { const exp = r.pairing?.code_expires_at; return `The code works once, for 30 minutes${exp ? `, until ${esc(new Date(exp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}` : ''}, and only with this hub.`; };
+/* The prompt is the same for every PC of the hub and holds no secret; the code is shown apart, and the agent asks for it. */
+const obGiveH = (r) => vnote(`Give the user of <b>${esc(r.pc.name)}</b> the prompt and the code. They paste the prompt into their agent, which sets everything up and asks them for the code. The prompt holds no secret; send the code directly, not through a shared chat. ${obCodeLife(r)} <b>New code</b> makes a new one and voids this one.`);
+const obCodeH = (r) => `<div class="fld ob-code"><span class="vlabel">Code</span>${codeBox(r.pairing.code, true)}</div>`;
 /* Why Add PC or Re-enrol PC gave no prompt (connector_unavailable): the hub has nothing the connector can check. There is no
    other prompt to fall back to, so the sheet says what to fix on the hub. */
-/* Add PC's first step: the installer to run on the PC. Its file is named after the newest approved connector version
-   (connector_version), and the link is the Releases page when the hub has one (docs/connector.md, "Add PC"). */
-const jnInstallH = (made) => {
-  const file = `conclave-install-${made.connector_version || '<version>'}.mjs`, pc = `<b>${esc(made.pc.name)}</b>`;
-  const get = made.download_url ? `download <code>${esc(file)}</code> from <a href="${esc(made.download_url)}" target="_blank" rel="noopener noreferrer">GitHub Releases</a>` : `copy <code>${esc(file)}</code> from the connector's release files to it`;
-  return `<div class="jn-dl">${ic('dl')}<span><b>1.</b> Install the connector on ${pc}: ${get}, then run <code class="ob-chip">node ${esc(file)}</code> in a terminal there. It installs the connector and opens its pairing screen.</span></div>`;
-};
 const OB_NO_PROMPT = {
   no_ca: "The hub has no CA certificate (<code>CA_CERT_FILE</code>), so the connector can't check the hub before it sends the code.",
   no_origin: "The hub's public address isn't HTTPS (<code>PUBLIC_URL</code>), so the connector has no hub address to check.",
 };
-const obNoPrompt = (r) => `<div class="alert ob-none" role="alert"><b>No prompt for ${esc(r.pc.name)}</b><span>${OB_NO_PROMPT[r.connector_unavailable] || OB_NO_PROMPT.no_ca} Fix that on the hub, then use <b>Re-enrol PC</b> on the PC's page for a new code.</span></div>`;
+const obNoPrompt = (r) => `<div class="alert ob-none" role="alert"><b>No prompt for ${esc(r.pc.name)}</b><span>${OB_NO_PROMPT[r.connector_unavailable] || OB_NO_PROMPT.no_ca} Fix that on the hub, then use <b>Re-enrol PC</b> on the PC's page for a new prompt.</span></div>`;
 /* After a leak rotation the connector's app key on the key's PC was replaced (docs/onboarding.md, key handover): its new
    pairing code is shown here once. The PC user pairs the connector again; until then no agent on that PC reaches the hub. */
 function rotPairSheet(r) {
@@ -6147,47 +6150,50 @@ function rotPairSheet(r) {
   const b = $('.ob-pr [data-copy]'); if (b) b.dataset.copy = p.code;
   onceArm($('.ob-pr'));
 }
-/* Re-enrol PC's sheet: the pairing step, then the connector prompt with Copy. The code works once and is not shown again. */
+/* Re-enrol PC's sheet: the one prompt with Copy, the code apart, and New code (the old one is void). The code is not shown again. */
 function obPromptSheet(r, title) {
   const ok = !!(r.connector_prompt && r.pairing);
-  openSheet({ title, html: `<div class="sheet-form ob-pr">
-    ${ok ? `${obPairH(r)}
-    ${vnote(`Then paste this into the coding agent (Claude Code, Codex or another) on <b>${esc(r.pc.name)}</b> and add the team you want. It holds no code and no key.`)}
+  const sh = openSheet({ title, html: `<div class="sheet-form ob-pr">
+    ${ok ? `${obGiveH(r)}
     <div class="code mono ob-prompt" data-v="${esc(r.connector_prompt)}" tabindex="0" aria-label="Prompt">${esc(r.connector_prompt)}</div>
+    ${obCodeH(r)}
     ${obHubFacts(r.pairing)}` : obNoPrompt(r)}
-    <div class="sheet-acts"><button type="button" class="btn lg" data-sheet-close>Done</button>${ok ? `<button type="button" class="btn pri lg" data-copy>${ic('copy')}Copy prompt</button>` : ''}</div></div>` }).classList.add('wide');
+    <div class="sheet-acts"><button type="button" class="btn lg" data-sheet-close>Done</button>${ok ? `<button type="button" class="btn lg" id="obNewP">${ic('rot')}New code</button><button type="button" class="btn pri lg" data-copy>${ic('copy')}Copy prompt</button>` : ''}</div></div>` });
+  sh.classList.add('wide');
   if (!ok) return;
   // data-copy reads the nearest [data-v]: point the button at the prompt.
   const b = $('.ob-pr [data-copy]'); if (b) b.dataset.copy = r.connector_prompt;
+  $('#obNewP', sh).onclick = () => run(async () => { const n = await obNewPrompt(r, sh, 'obNewP'); if (n) obPromptSheet(n, title); });
   onceArm($('.ob-pr'));
 }
-/* Add PC (header, after Lockdown; the More sheet on phones; the PCs page): one screen that onboards a PC. Three steps, the PC
-   name and an optional "what the team should do" (appended to the prompt's "What I want:"), then the prompt in place with Copy,
-   the hub URL and the CA fingerprint. POST /pcs/add creates the PC, its onboarding app key and a single-use code. While the sheet
+/* New prompt: a new code for the same PC, and the old code is void (POST /pcs/:id/prompt). Once the PC has paired, the hub
+   refuses and Re-enrol PC is the way. The first click arms the button; returns the new answer, or null until confirmed. */
+async function obNewPrompt(r, sh, id) {
+  if (!confirmOnce(sh, id, 'New code: the old one stops working')) return null;
+  const n = await post(`/pcs/${encodeURIComponent(r.pc.id)}/prompt`, r.pairing?.relay ? { relay_id: r.pairing.relay.id } : {});
+  toast('New code made. The old one no longer works');
+  return n;
+}
+/* Add PC (header, after Lockdown; the More sheet on phones; the PCs page): one screen that onboards a PC. The PC name, then the
+   hub's one prompt with Copy, the code apart, the hub URL and the CA fingerprint. POST /pcs/add creates the PC, its onboarding app key and a single-use code. While the sheet
    stays open it follows the PC through the existing routes (its enrolment, then pending onboarding requests) every 3 s. */
-const JOIN_WANT = 'What I want:';
-const joinPrompt = (text, want) => { const w = want.trim(); if (!w) return text; const t = text.replace(/\s+$/, ''); return t.endsWith(JOIN_WANT) ? `${t}\n${w}\n` : `${t}\n\n${JOIN_WANT}\n${w}\n`; };
-/* The active PCs by name, for the Team choice: "on pc-a, pc-b and 2 more", or "" when there are none. */
 const joinKnown = () => { const n = (S.pcs || []).filter((p) => p.status === 'active').map((p) => p.name); return n.length ? `: ${esc(n.slice(0, 4).join(', '))}${n.length > 4 ? ` and ${n.length - 4} more` : ''}` : ''; };
-/* The coding agents the prompt can go into; Another agent is any client that reads the prompt and runs setup. */
-const JN_CLIENTS = [['claude_code', 'Claude Code'], ['codex', 'Codex'], ['other', 'Another agent']];
-const jnAgent = (c) => (c === 'other' ? 'your coding agent' : promptClient(c));
 /* Add (header, the More sheet on phones, the command list) opens on "What do you want to add?": a new PC, or a team on a PC that
    is already connected (the existing New team screen). The PCs page's Add PC opens straight on the new-PC screen, with Back to
    the choices. There is no choice for an agent: the console has no flow that adds a new agent to a team on its own PC. */
 function joinSheet(anchor, start = 'choose') {
-  let made = null, timer = 0, client = 'claude_code';
+  let made = null, timer = 0;
   const known = joinKnown();
   const sh = openSheet({ title: 'What do you want to add?', anchor, html: `<div class="sheet-form jn">
     <div id="jnChoose" class="jn-opts" role="group" aria-label="What to add">
-      <button type="button" class="jn-opt" id="jnOptPc">${ic('pc')}<span><b>A new PC</b><span>Connect a new PC to Conclave and set up its security and keys. Its first team comes with it.</span></span>${ic('chev')}</button>
+      <button type="button" class="jn-opt" id="jnOptPc">${ic('pc')}<span><b>A new PC</b><span>Connect a new PC to Conclave and set up its security and keys. The PC joins with its first team already set up.</span></span>${ic('chev')}</button>
       <button type="button" class="jn-opt" id="jnOptTeam">${ic('team')}<span><b>A team</b><span>On a PC that's already connected${known}</span></span>${ic('chev')}</button>
+      <button type="button" class="jn-opt" id="jnOptInv">${ic('hub')}<span><b>A collaborator's agent</b><span>Invite someone's agent, on their own PC, to one of your teams</span></span>${ic('chev')}</button>
     </div>
     <div id="jnPcView" class="jn-pc" hidden>
       <div class="jn-lead"><b>Use this to connect a new PC to Conclave and set up its security and keys.</b></div>
       <label class="fld"><span class="vlabel">PC name</span><input class="inp" id="jnN" maxlength="80" autocomplete="off" placeholder="e.g. grants-laptop"></label>
-      <div class="fld"><span class="vlabel" id="jnCl">The PC's coding agent</span><div class="seg fit" id="jnC" role="group" aria-labelledby="jnCl">${JN_CLIENTS.map(([v, n], i) => `<button type="button" class="${i === 0 ? 'on' : ''}" data-v="${v}">${n}</button>`).join('')}</div></div>
-      <label class="fld"><span class="vlabel">What its team should do <span class="kv-sub">optional</span></span><textarea class="inp" id="jnW" rows="3" maxlength="2000" placeholder="The project, the team's goal and the roles you need, e.g. Project Atlas: a coordinator, two developers and a reviewer to build the grant tracker."></textarea><span class="hint">Added to the prompt. The agent on the PC asks for anything missing.</span></label>
+      <p class="hint">You get one prompt and one code. The agent on the PC asks its user what they need: a new project, a new team, or another agent for a team on this PC.</p>
       <span class="err" id="jnErr" role="alert"></span>
       <div class="sheet-acts" id="jnGoRow"><button type="button" class="btn lg" data-sheet-close>Cancel</button><button type="button" class="btn pri lg" id="jnGo">${ic('plus')}Get the prompt</button></div>
       <div id="jnOut" hidden></div>
@@ -6205,9 +6211,9 @@ function joinSheet(anchor, start = 'choose') {
   back.onclick = () => view('choose');
   $('#jnOptPc', sh).onclick = () => view('pc');
   $('#jnOptTeam', sh).onclick = () => { closeSheet(); go('tbuild'); };
-  tick($('#jnC', sh), (b) => { client = b.dataset.v; });
-  const want = $('#jnW', sh), out = $('#jnOut', sh);
-  const text = () => joinPrompt(made.connector_prompt, want.value);
+  $('#jnOptInv', sh).onclick = () => { closeSheet(); run(invSheet); };
+  const out = $('#jnOut', sh);
+  const text = () => made.connector_prompt;
   const status = (tone, html) => { const w = $('#jnSt', sh); if (!w) return; w.className = 'wait jn-st' + (tone ? ' ' + tone : ''); w.innerHTML = html; };
   const waitH = (label) => `<span class="dot pulse"></span><span>${label}</span>`;
   async function poll() {
@@ -6218,6 +6224,7 @@ function joinSheet(anchor, start = 'choose') {
       if (!sh.isConnected) return;
       // The PC used the code: the prompt did its job, so closing no longer asks.
       if (e && e.status !== 'unused' && ONCE && ONCE.el === out) ONCE.copied = true;
+      const np = $('#jnNewP', sh); if (np && e && e.status !== 'unused') np.hidden = true;
       if (req) {
         status('ok', `${ic('check')}<span>Request filed${req.team_name ? ` for <b>${esc(req.team_name)}</b>` : ''}${req.agents ? ` · ${plural(req.agents, 'agent')}` : ''}</span><span class="grow"></span><button type="button" class="btn sm pri" id="jnReview">Review it</button>`);
         $('#jnReview', sh).onclick = () => { const id = req.id; closeSheet(); go('ob', id); };
@@ -6246,18 +6253,24 @@ function joinSheet(anchor, start = 'choose') {
       if (p) $('#jnOpenPc', sh).onclick = () => { closeSheet(); openD('pc', p.id); };
       return;
     } finally { if (!made) { go.disabled = false; go.removeAttribute('aria-busy'); go.innerHTML = label; } }
-    $('#jnN', sh).disabled = true; $$('#jnC button', sh).forEach((b) => { b.disabled = true; }); $('#jnGoRow', sh).hidden = true; out.hidden = false; back.hidden = true;
+    $('#jnN', sh).disabled = true; $('#jnGoRow', sh).hidden = true; out.hidden = false; back.hidden = true;
     // Only the connector prompt: without one (no CA, or no HTTPS address) the sheet says why, and nothing else is offered.
     if (!made.connector_prompt || !made.pairing) { out.innerHTML = `${obNoPrompt(made)}<div class="sheet-acts jn-acts"><button type="button" class="btn lg" data-sheet-close>Done</button></div>`; refresh(); return; }
-    out.innerHTML = `${jnInstallH(made)}
-      ${obPairH(made, '<b>2.</b> ')}
-      ${vnote(`<b>3.</b> Open <b>${esc(jnAgent(client))}</b> on <b>${esc(made.pc.name)}</b> and paste this prompt into it. The prompt holds no code and no key: the agent asks what the team should do, drafts the team request and files it through the connector.`)}
-      <div class="sheet-acts jn-acts"><button type="button" class="btn lg" data-sheet-close>Done</button><button type="button" class="btn pri lg" id="jnCopy">${ic('copy')}Copy prompt</button></div>
+    out.innerHTML = `<div id="jnGive">${obGiveH(made)}</div>
+      <div class="sheet-acts jn-acts"><button type="button" class="btn lg" data-sheet-close>Done</button><button type="button" class="btn lg" id="jnNewP">${ic('rot')}New code</button><button type="button" class="btn pri lg" id="jnCopy">${ic('copy')}Copy prompt</button></div>
       <div class="wait jn-st" id="jnSt" role="status" aria-live="polite"></div>
       <div class="code mono ob-prompt jn-prompt" id="jnP" tabindex="0" aria-label="Prompt"></div>
+      <div id="jnCode">${obCodeH(made)}</div>
       ${obHubFacts(made.pairing)}`;
     const draw = () => { $('#jnP', sh).textContent = text(); };
-    draw(); want.oninput = draw;
+    draw();
+    // New code: the old one void; the PC record and its key stay. Refused once the PC has paired.
+    $('#jnNewP', sh).onclick = () => run(async () => {
+      const n = await obNewPrompt(made, sh, 'jnNewP'); if (!n || !sh.isConnected) return;
+      made = { ...made, ...n }; draw(); $('#jnGive', sh).innerHTML = obGiveH(made); $('#jnCode', sh).innerHTML = obCodeH(made);
+      if (ONCE && ONCE.el === out) ONCE.copied = false;
+      const nb = $('#jnNewP', sh); nb.classList.remove('armed'); nb.innerHTML = `${ic('rot')}New code`;
+    });
     $('#jnCopy', sh).onclick = async () => { try { await navigator.clipboard.writeText(text()); if (ONCE && ONCE.el === out) ONCE.copied = true; toast('Prompt copied'); } catch { toast('Copy failed: select the prompt and copy it'); } };
     onceArm(out);
     status('', waitH(`Waiting for <b>${esc(made.pc.name)}</b>. You'll approve its request here.`));
@@ -6271,6 +6284,75 @@ function joinSheet(anchor, start = 'choose') {
   SHEET.onClose = () => { clearTimeout(timer); if (made && DR.type === 'pcs') setTimeout(() => openD('pcs', null, true)); };
 }
 const obAddPc = () => joinSheet(null, 'pc'); // a centred dialog: the prompt needs the width
+// ==== Invite a collaborator's agent ====
+/* Invite (docs/onboarding.md#an-invite-for-a-collaborator): the operator invites a collaborator's agent to one team and role.
+   Making the invite is the approval: the folders must sit inside the collaborator's own grants (write needs Contribute), and
+   the hub checks it all again when their PC joins. The code is never shown here: the collaborator opens it in their own
+   console, behind sign-in and two-factor. The sheet lists the open invites with Withdraw. Text from the hub is escaped. */
+const INV_ROLES = [['worker', 'Worker'], ['reviewer', 'Reviewer'], ['stakeholder', 'Stakeholder']];
+const invState = (v) => (v.status !== 'open' ? v.status : v.paired ? 'paired' : v.code_opened_at ? 'code opened' : 'not opened yet');
+const invRows = (list) => list.filter((v) => v.status === 'open').map((v) => row({ one: false, as: 'div', lead: ic('hub'), title: `${v.owner.name} · ${v.team.name} ${v.role}`,
+  meta: `${invState(v)} · until ${new Date(v.expires_at).toLocaleDateString()}`, trail: `<button type="button" class="btn sm" data-inv-rm="${esc(v.id)}">Withdraw</button>` })).join('')
+  || none('hub', 'No open invites');
+async function invSheet() {
+  const [us, iv, rl] = await Promise.all([api('/users'), api('/invites'), api('/relays').catch(() => null)]);
+  const relays = rl?.relays || [];
+  const members = (us.users || []).filter((x) => x.role === 'member' && x.status === 'active'), teams = (S.teams || []).filter((t) => !['done', 'stopped'].includes(t.status));
+  const sh = openSheet({ title: "Invite a collaborator's agent", html: `<div class="sheet-form inv">
+    <p class="hint">Their agent joins one team in one role. Making the invite approves it: nobody clicks again when their PC joins. They see the code in their own console, behind sign-in and two-factor.</p>
+    ${members.length && teams.length ? `${selField('invUser', 'Collaborator', members.map((m) => [m.id, m.display_name || m.username]), members[0].id)}
+    ${selField('invTeam', 'Team', teams.map((t) => [t.id, t.project ? `${t.project} · ${t.name}` : t.name]), teams[0].id)}
+    ${selField('invKind', 'Kind of role', INV_ROLES, 'worker')}
+    <label class="fld"><span class="vlabel">Role name <span class="kv-sub">optional</span></span><input class="inp" id="invRole" maxlength="30" autocomplete="off" placeholder="Same as the kind, e.g. writer"></label>
+    <label class="fld"><span class="vlabel">Vault folder <span class="kv-sub">optional</span></span><input class="inp" id="invPath" maxlength="400" autocomplete="off" placeholder="/${esc(S.me?.vault_alias || 'vault')}/Shared/Team"></label>
+    <div class="seg fit" id="invAcc" role="group" aria-label="Folder access"><button type="button" class="on" data-v="read">Read</button><button type="button" data-v="write">Write</button></div>
+    <span class="hint">Only inside a folder shared with them; Write needs Contribute there.</span>
+    ${relays.length ? selField('invRelay', 'Their PC reaches the hub', [['', 'Directly'], ...relays.map((r) => [r.id, `Through relay ${r.name}`])], '') : ''}
+    <label class="fld"><span class="vlabel">Valid for (days)</span><input class="inp sm w-num" id="invDays" type="number" min="1" max="90" value="7"></label>
+    <span class="err" id="invErr" role="alert"></span>
+    <div class="sheet-acts"><button type="button" class="btn lg" data-sheet-close>Done</button><button type="button" class="btn pri lg" id="invGo">${ic('plus')}Invite</button></div>`
+    : vnote(members.length ? 'No team is running to invite to.' : 'No collaborator yet. Add a member under Users first.')}
+    ${overline('Open invites')}<div id="invList">${invRows(iv.invites || [])}</div></div>` });
+  sh.classList.add('wide');
+  let acc = 'read';
+  tick($('#invAcc', sh), (b) => { acc = b.dataset.v; });
+  const redraw = async () => { $('#invList', sh).innerHTML = invRows((await api('/invites')).invites || []); };
+  $('#invList', sh).onclick = (e) => { const b = e.target.closest('[data-inv-rm]'); if (!b) return;
+    if (!b.classList.contains('armed')) { b.classList.add('armed'); b.textContent = 'Withdraw: the code stops working'; return; }
+    run(async () => { await api(`/invites/${encodeURIComponent(b.dataset.invRm)}`, 'DELETE'); toast('Invite withdrawn'); await redraw(); }); };
+  const go = $('#invGo', sh); if (!go) return;
+  go.onclick = () => run(async () => {
+    const path = $('#invPath', sh).value.trim().replace(/\/+$/, ''), days = Math.floor(+$('#invDays', sh).value), role = $('#invRole', sh).value.trim();
+    const err = $('#invErr', sh); err.textContent = '';
+    if (!Number.isInteger(days) || days < 1 || days > 90) { err.textContent = 'Valid for: 1 to 90 days.'; return; }
+    try {
+      const relay = $('#invRelay', sh)?.value || '';
+      await post('/invites', { owner_id: $('#invUser', sh).value, team_id: $('#invTeam', sh).value, team_role: $('#invKind', sh).value, ...(role ? { role } : {}), folders: path ? [{ path, access: acc }] : [], days, ...(relay ? { relay_id: relay } : {}) });
+    } catch (e) { err.textContent = e.message; return; }
+    const who = $('#invUser', sh).selectedOptions[0]?.textContent || 'They';
+    toast(`Invite made. ${who} finds it on their Home`);
+    await redraw();
+  });
+}
+/* The collaborator's side (Home): "Join <team> as <role>". Show code opens a code for 30 minutes and voids the one before;
+   the prompt beside it is the hub's one prompt. Both are held in the page only (INV.code), never stored. */
+const INV = { code: {} };
+const invMine = async () => ((await api('/me/invites').catch(() => null))?.invites || []);
+function invMemberHtml(list) {
+  return (list || []).map((v) => {
+    const C = INV.code[v.id], what = `<b>Join ${esc(v.team.name)} as ${esc(v.role)}</b><p class="hint">Your agent joins ${esc(v.project ? `${v.project} · ` : '')}${esc(v.team.name)} with what the operator approved. Paste the prompt into the agent on your PC; it asks you for the code.</p>`;
+    if (v.paired) return `<div class="card dlg-mu ok"><b>Your PC joined with this invite</b><p class="hint">The connector on your PC sets up the agent for ${esc(v.team.name)}.</p></div>`;
+    if (!C) return `<div class="card dlg-mu acc">${what}<div class="dlg-mu-acts"><button type="button" class="btn pri" data-inv-mu="code" data-id="${esc(v.id)}">${ic('play')}Show the code</button></div><p class="hint">The code works for 30 minutes from when you open it.</p></div>`;
+    return `<div class="card dlg-mu acc">${what}<span class="vlabel">Prompt</span><div class="co-prompt">${codeBox(C.prompt || '', true)}</div>
+      <span class="vlabel">Code</span>${codeBox(C.code, true)}<p class="hint">Works once, until ${esc(new Date(C.expires_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}. Pass it only to the installer; don't share it.</p>
+      <div class="dlg-mu-acts"><button type="button" class="btn" data-inv-mu="code" data-id="${esc(v.id)}">${ic('rot')}New code</button></div></div>`;
+  }).join('');
+}
+async function invMemberAct(id) {
+  try { const r = await post(`/me/invites/${encodeURIComponent(id)}/code`, {}); INV.code[id] = { code: r.code, prompt: r.connector_prompt, expires_at: r.pairing?.code_expires_at ?? Date.now() + 30 * 60_000 }; }
+  catch (e) { toast(e.message, true); }
+  await muDraw(false);
+}
 async function obReEnrol(p) {
   const r = await post(`/pcs/${p.id}/re-enrol`);
   await refresh(); if (DR.type === 'pc') await openD('pc', p.id, true);
@@ -6280,14 +6362,14 @@ async function obReEnrol(p) {
 /* Settings → Onboarding: the per-request limits and the filing rate limits (per PC key). */
 async function obSettings(anchor) {
   const [s, cs, ow] = await Promise.all([api('/settings/onboarding').then((r) => r.settings), coSetLoad(), api('/agent-owners').catch(() => null)]);
-  const F = [['max_roles', 'Roles', 'Most roles one request may ask for.'], ['max_agents', 'Agents', 'Most agents in one request, all roles together.'], ['max_per_role', 'Agents a role', 'Most agents one role may ask for.'], ['max_rules', 'Rules', 'Most rules one request may propose as directives. 0 turns proposals off.'], ['max_requirements', 'Requirements', 'Most requirements a new-team request may propose for its Blueprint part. 0 turns them off.'],
-    ['file_per_hour', 'Filings an hour', 'Per PC key: filing, amending and withdrawing.'], ['file_per_day', 'Filings a day', 'Per PC key: filing, amending and withdrawing.']];
-  const sh = fbSheet({ title: 'Settings', anchor, label: 'Save', fields: `${overline('Onboarding')}<p class="hint">Per request, and per PC key for filings.</p><div>${F.map(([k, l, tip]) => row({ one: true, as: 'div', title: l, trail: info(tip) + `<input class="inp sm w-num" type="number" min="${k === 'max_rules' || k === 'max_requirements' ? 0 : 1}" max="1000" data-obs="${k}" value="${esc(s[k])}" aria-label="${esc(l)}">` })).join('')}</div>${coSetHtml(cs)}${ow ? `<div id="owSet">${owSetHtml(ow)}</div>` : ''}`,
+  const F = [['max_roles', 'Roles per request', 'The most roles one team request can ask for.'], ['max_agents', 'Agents per request', 'The most agents one request can ask for, all roles together.'], ['max_per_role', 'Agents per role', 'The most agents one role can ask for.'], ['max_rules', 'Directives per request', 'The most directives one request can suggest; 0 turns this off.'], ['max_requirements', 'Requirements per request', 'The most Blueprint requirements a new team can suggest; 0 turns this off.'],
+    ['file_per_hour', 'Requests per PC each hour', 'Sending, changing and withdrawing a request each count once.'], ['file_per_day', 'Requests per PC each day', 'Sending, changing and withdrawing a request each count once.']];
+  const sh = fbSheet({ title: 'Settings', anchor, label: 'Save', fields: `<div class="ob-set">${overline('Onboarding')}<p class="hint">Limits on what a PC can ask for when it sets up a team.</p><div>${F.map(([k, l, tip]) => row({ as: 'div', title: l, meta: tip, trail: `<input class="inp sm w-num" type="number" min="${k === 'max_rules' || k === 'max_requirements' ? 0 : 1}" max="1000" data-obs="${k}" value="${esc(s[k])}" aria-label="${esc(l)}">` })).join('')}</div>${coSetHtml(cs)}${ow ? `<div id="owSet">${owSetHtml(ow)}</div>` : ''}</div>`,
     onGo: async (sh) => {
       const b = {}; for (const i of $$('[data-obs]', sh)) { const v = Number(i.value), lo = +i.min; if (!Number.isInteger(v) || v < lo) return `${i.getAttribute('aria-label')}: a whole number of at least ${lo}.`; b[i.dataset.obs] = v; }
       const ce = coSetPending(sh, cs); if (ce) return ce;
       // An empty list refuses every repo URL, and open checkouts that name a repo cannot render: one more click first.
-      if (cs && !cs.edit.length && cs.hosts.length && !confirmOnce(sh, 'fbGo', 'Save with no repo hosts')) return 'No repo URL will be accepted, and open checkouts that name a repo cannot render.';
+      if (cs && !cs.edit.length && cs.hosts.length && !confirmOnce(sh, 'fbGo', 'Save with no repo hosts')) return 'With no hosts, a moved agent cannot copy any repo, and open checkouts that need one stop.';
       // Repo hosts first: their check is the one more likely to refuse, and a failure then leaves nothing half saved.
       try { await coSetSave(cs); } catch (e) { return `Nothing saved: ${e.message}`; }
       try { await api('/settings/onboarding', 'PUT', b); } catch (e) { return `${cs ? 'Repo hosts saved; onboarding limits' : 'Onboarding limits'} not saved: ${e.message}`; }
@@ -6300,11 +6382,11 @@ async function obSettings(anchor) {
 /* Settings → Agent owners (docs/authorization.md#agent-owners): the one audited claim of the agents that had no owner, and
    the owner enforcement switch, which stays off until the claim has run. Both act at once, apart from the sheet's Save. */
 const owSetHtml = (o) => {
-  const claimed = o.claim ? `Claimed by ${esc(o.claim.by_label || 'an admin')} ${ago(o.claim.at)} ago: ${esc(plural(o.claim.agents, 'agent'))}.` : 'Not claimed yet.';
-  return overline('Agent owners', null, info('Every agent belongs to a person. Agents made before owners existed have none until you claim them.'))
-    + row({ one: true, as: 'div', title: o.unowned ? `${plural(o.unowned, 'agent')} without an owner` : 'Every agent has an owner', meta: raw(claimed),
-      trail: o.unowned ? `<button type="button" class="btn sm" id="owClaim">${ic('user')}Claim all existing agents as mine</button>` : '' })
-    + row({ one: true, as: 'div', title: 'Owner enforcement', meta: o.claim ? (o.enforcement ? 'On: owners limit what their agents may do.' : 'Off: agents keep today\'s rules.') : 'Off until you claim the existing agents.',
+  const claimed = o.claim ? `Claimed by ${esc(o.claim.by_label || 'an admin')} ${ago(o.claim.at)} ago: ${esc(plural(o.claim.agents, 'agent'))}.` : o.unowned ? 'Claim them to become their owner.' : 'Not claimed yet.';
+  return overline('Agent owners') + '<p class="hint">Each agent belongs to a person, who can limit what it does.</p>'
+    + row({ as: 'div', title: o.unowned ? `${plural(o.unowned, 'agent')} without an owner` : 'Every agent has an owner', meta: raw(claimed) })
+    + (o.unowned ? `<div class="ob-act"><button type="button" class="btn sm" id="owClaim">${ic('user')}Claim all existing agents as mine</button></div>` : '')
+    + row({ as: 'div', title: 'Owner enforcement', meta: o.claim ? (o.enforcement ? 'On: an agent can do only what its owner allows.' : 'Off: agents keep the rules they have.') : 'Off until you claim the agents above.',
       trail: switchBtn('Owner enforcement', o.enforcement, `id="owEnf"${o.claim ? '' : ' disabled'}`) })
     + '<span class="err" id="owErr" role="alert"></span>';
 };
@@ -6495,16 +6577,16 @@ async function dlgMemberAct(kind, id) {
 async function coSetLoad() { const r = await api('/settings/checkout').catch(() => null); return r ? { ...r.settings, edit: [...r.settings.hosts] } : null; }
 const CO_HOST_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
 const coSetRows = (cs) => cs.edit.map((h) => row({ one: true, as: 'div', lead: ic('link'), title: raw(`<span class="mono">${esc(h)}</span>`), trail: `<button type="button" class="btn ic sm" data-cs-rm="${esc(h)}" aria-label="Remove ${esc(h)}">${ic('x')}</button>` })).join('')
-  || none('link', 'No repo hosts: no handout may name a repo URL');
-const coSetHead = (cs) => overline('Checkout · repo hosts', cs.edit.length, info('A moved agent clones only from these hosts. Exact names, no wildcards; checked at the handout and again at render.'));
+  || none('link', 'No hosts: a moved agent cannot copy any repo');
+const coSetHead = (cs) => overline('Checkout · repo hosts', cs.edit.length) + '<p class="hint">An agent moved to another PC can copy code only from these hosts.</p>';
 const coSetHtml = (cs) => !cs ? '' : `<div id="csHd">${coSetHead(cs)}</div>
   <div id="csL">${coSetRows(cs)}</div>
   <div class="cs-add"><input class="inp" id="csIn" maxlength="253" placeholder="Host, e.g. github.com" aria-label="Repo host" autocomplete="off" spellcheck="false"><button type="button" class="btn" id="csAdd">${ic('plus')}Add</button></div>
-  ${cs.source === 'settings' ? '' : `<p class="hint">${cs.source === 'env' ? 'From CONCLAVE_REPO_HOSTS until you save.' : 'The default until you save.'}</p>`}`;
+  ${cs.source === 'settings' ? '' : `<p class="hint">${cs.source === 'env' ? 'Set by the hub\'s environment until you save.' : 'The built-in list until you save.'}</p>`}`;
 /* A host typed but not added yet: add it on Save, or say why it can't be. */
 const coSetPending = (sh, cs) => { if (!cs) return null; const v = $('#csIn', sh)?.value.trim().toLowerCase(); if (!v) return null; return coSetAdd(sh, cs, v); };
 function coSetAdd(sh, cs, v) {
-  if (!CO_HOST_RE.test(v) || v.length > 253) return `${v}: a host name only, such as github.com (no https://, port, path or *).`;
+  if (!CO_HOST_RE.test(v) || v.length > 253) return `${v}: type a host name only, such as github.com.`;
   if (!cs.edit.includes(v)) cs.edit.push(v);
   $('#csIn', sh).value = ''; coSetDraw(sh, cs); return null;
 }
@@ -7283,6 +7365,8 @@ const dur2 = (ms) => { const m = Math.round(Math.abs(ms) / 60000); return m < 60
    connector reports, an unseen item reads "Not delivered yet". Design §3g: "Not delivered: why", "Waiting behind task X" while the
    agent's woken run works on another task, and "PC offline since hh:mm" (never "asleep"). Empty once it was delivered and read. */
 const CN_ISO = { standard: 'Standard isolation', hardened: 'Hardened isolation' };
+const CN_LEFT = { unfinished_move: 'an unfinished move to the connector (rollback copies)', ca_setting: 'the old CA setting', old_keys: 'the old key file', bridge_pieces: 'the old bridge and helper files' };
+const leftoverText = (k) => (Array.isArray(k) && k.length ? k.map((x) => CN_LEFT[x]).filter(Boolean).join(', ') : '');
 const CN_KEYSTORE = { dpapi: 'keys encrypted with Windows DPAPI', keychain: 'keys encrypted, secret in the macOS login keychain', secret_service: 'keys encrypted, secret in the Linux secret service', file: 'keys encrypted, secret in a private file', service: 'keys held by the key service' };
 const DELIV = { pc_offline: 'Not delivered: waiting for the PC', chat_in_use: 'Not delivered: chat in use', wake_held: 'Not delivered: waking is off for this agent on its PC', agent_unknown: 'Not delivered: this PC has no folder for the agent', connector_too_old: 'Not delivered: connector too old' };
 const atTime = (t) => { const d = new Date(t), hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; return d.toDateString() === new Date().toDateString() ? hm : dt(t); };
@@ -7750,6 +7834,7 @@ function bpCard(t, id, s, ny = null) {
   // Coverage is a view of the gaps (§6), after Appendix: a count, never a Needs you line.
   const cg = bpGapN(s.plain?.coverage), cov = s.plain?.coverage ? [bpLine('Coverage', to('cov'), cg ? plural(cg, 'gap') : 'No gaps')] : [];
   // Questions (§9): the row says what blocks work when something does, else how many questions are open.
+  const des = [bpLine('Designs', to('des'), '')];
   const qn = s.questions, qs = qn ? [bpLine('Questions', to('q'), qn.blocking ? `${qn.blocking} ${qn.blocking === 1 ? 'item blocks' : 'items block'} work` : qn.open ? `${qn.open} open` : 'None open')] : [];
   // The setup is one row here in every state (docs/onboarding.md#setup-progress); the team page then shows no Setup card.
   if (obSetupFolds(t.setup, s)) cov.push(obSetupLine(t.setup, t.project_id));
@@ -7758,9 +7843,9 @@ function bpCard(t, id, s, ny = null) {
       bpLine('Hypotheses', x('hypotheses').total ? list_('2', 'hypothesis', 'live') : to('2'), frac('hypotheses'), bar('hypotheses', 'ok')),
       bpLine('Findings', x('findings_month').done ? list_('2', 'finding', 'month') : to('2'), x('findings_month').done ? `${x('findings_month').done} this month` : '')])
       + ((s.papers || []).length ? overline('Papers') + list(s.papers.map((p) => bpLine(`${p.key}${p.target_at ? ' · ' + planDate(p.target_at) : ''}`, bpItemArg(pid, p.key), p.ready ? 'Ready' : `${p.supported} / ${p.total} claims`, { done: p.supported, total: p.total, tone: p.ready ? 'ok' : 'warn' }, 'data-bp'))) : '')
-      + overline('Plan') + list([...plan, ...cov, ...qs, ...dropped])
+      + overline('Plan') + list([...plan, ...cov, ...qs, ...des, ...dropped])
     : list([bpLine('Foundation', to('1'), ''), bpLine('Requirements', x('frs').total ? list_('2', 'fr,nfr', 'live') : to('2'), frac('frs'), bar('frs', 'ok')),
-      bpLine('Acceptance', x('acs').total ? list_('2', 'ac', 'live') : to('2'), frac('acs'), bar('acs')), ...plan, ...cov, ...qs, ...dropped]);
+      bpLine('Acceptance', x('acs').total ? list_('2', 'ac', 'live') : to('2'), frac('acs'), bar('acs')), ...plan, ...cov, ...qs, ...des, ...dropped]);
   return `<section class="sec bp-card">${head}${wait}${body}</section>`;
 }
 
@@ -8369,7 +8454,16 @@ function bpQSteps(it, d, lineQ) {
 }
 /* Decided in (§9): each decision whose source is this question, with its status; a superseded one names its successor. */
 const bpDecidedIn = (pid, L) => L.map((x) => row({ ...bpTM(x.key, x.status === 'accepted' ? `Decided in ${x.key}` : x.status === 'proposed' ? `Proposed: ${x.key}` : x.status === 'superseded' ? `${x.key}, superseded${x.superseded_by ? ' by ' + x.superseded_by : ''}` : `${x.key}, ${bpLabel(x.status).toLowerCase()}`, x.title, { 'data-bp': bpItemArg(pid, x.key) }), trail: bpSt(x.status), chev: true })).join('');
-const BP_SCREENS = ['res', '1', '2', '3', '4', '5', '6', 'needs', 'prop', 'dropped', 'mtg', 'cov', 'q'];
+/* Designs (docs/decisions.md, Designs): the decision items that are designs, Open (proposed) · Accepted · Rejected · Archived · All; a row opens the design read-only. */
+const BP_DES_ST = [['open', 'Open', (x) => x.status === 'proposed' && !x.archived], ['accepted', 'Accepted', (x) => x.status === 'accepted' && !x.archived], ['rejected', 'Rejected', (x) => x.status === 'rejected' && !x.archived], ['archived', 'Archived', (x) => x.archived], ['all', 'All', () => true]];
+async function bpDesigns(pid, status, go) {
+  const st = BP_DES_ST.find(([k]) => k === status) ? status : 'open', L = (await api(`/projects/${encodeURIComponent(pid)}/designs`)).designs;
+  const chips = BP_DES_ST.map(([k, l, f]) => `<button type="button" class="${k === st ? 'on' : ''}" aria-pressed="${k === st}" data-bpv="${esc(go('des', undefined, k))}">${esc(l)} <span class="faint">${L.filter(f).length}</span></button>`).join('');
+  const f = BP_DES_ST.find(([k]) => k === st)[2], R = L.filter(f);
+  const rows = R.map((x) => `<button type="button" class="lrow" data-design-item="${esc(pid + '|' + x.key)}" title="${esc(x.title + ' · ' + x.key)}"><span class="lrow-main"><span class="lrow-title">${mdText(x.title)}</span><span class="lrow-meta">${bpK(x.key)} · ${esc(x.status)}${x.archived ? ' · archived' : ''} · ${esc(x.review ? 'review: ' + x.review : 'not reviewed')}${x.mockups ? ' · ' + plural(x.mockups, 'mockup') : ''}</span></span>${ic('chev', 'chev')}</button>`).join('');
+  return `<div class="seg bp-seg" role="group" aria-label="Designs">${chips}</div><div class="bp-c">${rows || none('check', 'No designs here', true)}</div>`;
+}
+const BP_SCREENS = ['res', '1', '2', '3', '4', '5', '6', 'needs', 'prop', 'dropped', 'mtg', 'cov', 'q', 'des'];
 /* A cited note's day (YYYY-MM-DD, docs/blueprint.md §2.7) as the plan's short date; noon, so no time zone moves the day. */
 const bpNoteDate = (d) => (d ? planDate(`${d}T12:00:00`) : 'No date');
 /* A link that names no section opens the project's first page: the research workspace for a research project, Project Foundation otherwise. */
@@ -8442,6 +8536,8 @@ VIEWS.blueprint = async (arg) => {
       || `<div class="bp-c">${none('note', team ? 'No item in this part names a meeting note' : 'No item names a meeting note yet', true)}</div>`;
   } else if (tab === 'cov') {
     body = bpCoverage(pid, mine.plain?.coverage);
+  } else if (tab === 'des') {
+    body = await bpDesigns(pid, status, go).catch(() => `<div class="bp-c">${none('warn', 'The designs could not be read')}</div>`);
   } else if (tab === 'q') {
     body = await bpQuestions(pid, team, status, filt0, go, proj).catch(() => `<div class="bp-c">${none('warn', 'The questions could not be read')}</div>`);
   } else if (tab === 'dropped') {
@@ -8523,7 +8619,7 @@ VIEWS.blueprint = async (arg) => {
   const teamSelH = `<select class="sel sm bp-hsel" data-bp-team aria-label="Team">${teamOpts}</select>`;
   // Every section is its own screen, under "Blueprint · <project>" (ROUTES.blueprint); Back goes to the team page, whose Blueprint
   // card is the index (or to Home without a team).
-  const secLabel = tab === 'res' ? 'Papers and hypotheses' : tab === 'prop' ? 'Proposals' : tab === 'needs' ? 'Needs you' : tab === 'dropped' ? 'Dropped' : tab === 'mtg' ? 'Meetings' : tab === 'cov' ? 'Coverage' : tab === 'q' ? 'Questions' : bpSent(bpTabName(tab, kind));
+  const secLabel = tab === 'res' ? 'Papers and hypotheses' : tab === 'prop' ? 'Proposals' : tab === 'needs' ? 'Needs you' : tab === 'dropped' ? 'Dropped' : tab === 'mtg' ? 'Meetings' : tab === 'cov' ? 'Coverage' : tab === 'q' ? 'Questions' : tab === 'des' ? 'Designs' : bpSent(bpTabName(tab, kind));
   navName(pid, proj.name);
   // The app bar keeps only ⋯: Ask for a report is its first row at every width, then Export and Start over (desktop and tablet).
   const wide = !matchMedia('(max-width: 767.98px)').matches;
@@ -9527,15 +9623,19 @@ async function dirSheet({ title = 'New directive', d = null, anchor, onDone }) {
       <label class="fld"><span class="vlabel">Text (what agents must do)</span><textarea class="inp" id="dsB" data-req rows="6" maxlength="20000">${esc(d?.body || '')}</textarea></label>${sc.html}
       ${dirCatField(d ? d.category || (!d.reviewed_at && d.proposed_category) || '' : '', d && !d.category && !d.reviewed_at && d.proposed_category ? 'Category (the agent proposed it)' : 'Category')}
       <label class="fld"><span class="vlabel">Tags (comma-separated)</span><input class="inp" id="dsG" maxlength="400" value="${esc((d?.tags || []).join(', '))}" placeholder="e.g. git, vault" autocomplete="off"></label>
-      ${d ? fbArea('dsN', 'What changed (optional, agents see it)', 500, 2) : ''}`,
+      ${d ? `${fbArea('dsN', 'What changed (optional, agents see it)', 500, 2)}
+      <label class="co-chk"><input type="checkbox" id="dsMinor"> Minor edit, don't ask agents to re-read</label>` : ''}`,
     onGo: (s) => {
       const t = fbVal(s, 'dsT'), b = fbVal(s, 'dsB'), scope = get(), category = $('#dsC', s).value || null, tags = dirTagList($('#dsG', s).value);
       if (!t || !b) return 'Give a title and the text.';
       if (scope.kind !== 'hub' && !scope.ref) return 'Choose what it applies to.';
       if (tags.length > 10) return ['Use at most 10 tags.', 'dsG'];
+      // A minor edit (a typo) tells no agent; it cannot change who the directive applies to.
+      const minor = !!(d && $('#dsMinor', s)?.checked);
+      if (minor && (scope.kind !== d.scope_kind || (scope.ref ?? null) !== (d.scope_ref ?? null))) return 'A minor edit cannot change what the directive applies to.';
       run(async () => {
-        const r = d ? await api('/directives/' + encodeURIComponent(d.id), 'PATCH', { title: t, body: b, scope, note: fbVal(s, 'dsN') || null, category, tags }) : await post('/directives', { title: t, body: b, scope, category, tags });
-        toast(d ? 'Saved; agents are told' : 'Created; agents are told'); onDone?.(r.directive);
+        const r = d ? await api('/directives/' + encodeURIComponent(d.id), 'PATCH', { title: t, body: b, scope, note: fbVal(s, 'dsN') || null, category, tags, ...(minor ? { minor: true } : {}) }) : await post('/directives', { title: t, body: b, scope, category, tags });
+        toast(minor ? 'Saved as a minor edit; agents are not asked to re-read' : d ? 'Saved; agents are told' : 'Created; agents are told'); onDone?.(r.directive);
       });
     } });
   const get = sc.bind(sh);
@@ -11617,6 +11717,120 @@ VIEWS.reset = async () => {
   };
 };
 
+/* ---------- Security → Database: health, clean-up rules, checks and compaction (docs/operations.md) ---------- */
+const dbhSize = (n) => (n == null ? '—' : n >= 1073741824 ? (n / 1073741824).toFixed(1) + ' GB' : n >= 1048576 ? Math.round(n / 1048576) + ' MB' : n >= 1024 ? Math.round(n / 1024) + ' KB' : n + ' B');
+const dbhNum = (n) => (n == null ? '—' : Number(n).toLocaleString());
+const dbhDelta = (n) => (n == null ? '—' : (n > 0 ? '+' : '') + Number(n).toLocaleString());
+const dbhDay = (t) => { if (!t) return '—'; const d = new Date(t); return `${d.getDate()} ${MON[d.getMonth()]} ${d.getFullYear()}`; };
+const DBH_TABLE = { audit_events: 'Audit rows', authentication_events: 'Sign-in events', tool_invocations: 'Tool calls', resource_access_events: 'File access events', security_alerts: 'Closed alerts',
+  credentials: 'Keys', session_tokens: 'Logins', message_delivery_cursors: 'Read positions', message_ack_snapshots: 'Read snapshots', permission_policies: 'Key rule sets', permission_rules: 'Key rules', policy_versions: 'Key rule versions',
+  onboarding_requests: 'Onboarding requests', onboarding_events: 'Request history', onboarding_slots: 'Request slots', checkouts: 'Checkouts', handouts: 'Handouts', checkout_scans: 'Checkout scans',
+  enrolment_codes: 'Enrolment codes', setup_keys: 'Setup and pairing codes', key_pickups: 'Key pickups', key_collections: 'Key collections', key_collect_polls: 'Collection polls',
+  machines: 'PCs', machine_folders: 'PC folders', connector_reports: 'Connector reports', connector_usage: 'Usage days', message_shown: 'Shown positions', agent_context: 'Agent context', pc_actions: 'PC orders',
+  agents: 'Agents', agent_notices: 'Notices', agent_links: 'Links', directive_acks: 'Directive confirmations', directive_reads: 'Directive reads', room_memberships: 'Chat memberships' };
+const dbhTable = (t) => DBH_TABLE[t] || (t.charAt(0).toUpperCase() + t.slice(1)).replace(/_/g, ' ');
+let DBH_RULES = [];
+const dbhRun = (r) => {
+  const d = r.details || {}, rl = (DBH_RULES.find((x) => x.key === r.rule) || {}).label || r.rule || '';
+  const title = r.kind === 'rule' ? (r.ok ? `${rl} · ${dbhNum(r.rows)} removed` : `${rl} · refused`)
+    : r.kind === 'rule_set' ? `${rl} · ${d.after && d.after.enabled ? 'on' : 'off'}, ${d.after ? d.after.days : ''} days`
+    : r.kind === 'check' ? `${r.rule === 'full' ? 'Full check' : 'Quick check'} · ${r.ok ? 'OK' : 'failed'}`
+    : `Compact · ${dbhSize(d.saved)} back`;
+  const meta = [dt(r.finished_at), r.trigger === 'scheduled' ? 'scheduled' : 'by hand', r.backup ? `backup ${r.backup}` : ''].filter(Boolean).join(' · ');
+  return row({ title, meta, trail: r.kind === 'rule_set' ? pill('Changed', 'info') : pill(r.ok ? 'Done' : 'Failed', r.ok ? 'ok' : 'bad') });
+};
+/* The password sheet every change and run goes through: what it does, then the password, the code when enrolled, and one action. */
+function dbhSheet({ title, body = '', go, goLabel, bad = false, anchor, onDone, onCancel }) {
+  const sh = openSheet({ title, anchor, onClose: () => onCancel && onCancel(), html: `<div class="sheet-form">${body}
+    <label class="fld"><span class="vlabel">Your password</span><input class="inp" id="dbhPw" type="password" autocomplete="current-password"></label>
+    ${S.me.totp_enrolled ? '<label class="fld"><span class="vlabel">Two-factor code</span><input class="inp mono" id="dbhCode" inputmode="numeric" maxlength="6" autocomplete="one-time-code"></label>' : ''}
+    <span class="err" id="dbhErr" role="alert"></span>
+    <div class="sheet-acts"><button type="button" class="btn lg" data-sheet-close>Cancel</button><button type="button" class="btn${bad ? ' bad' : ' pri'} lg" id="dbhGo" disabled>${bad ? ic('trash') : ''}${esc(goLabel)}</button></div></div>` });
+  const ready = () => { $('#dbhGo', sh).disabled = !($('#dbhPw', sh).value && (!$('#dbhCode', sh) || $('#dbhCode', sh).value.length === 6)); };
+  ['#dbhPw', '#dbhCode'].forEach((id) => { const el = $(id, sh); if (el) el.oninput = ready; });
+  $('#dbhGo', sh).onclick = () => run(async () => {
+    $('#dbhErr', sh).textContent = '';
+    let r;
+    try { r = await go({ password: $('#dbhPw', sh).value, ...($('#dbhCode', sh) ? { totp: $('#dbhCode', sh).value } : {}) }); }
+    catch (e) { $('#dbhErr', sh).textContent = e.message; $('#dbhPw', sh).value = ''; ready(); return; }
+    onCancel = null; closeSheet(); onDone(r);
+  });
+  return sh;
+}
+const dbhReopen = () => openD('db', '', true);
+
+VIEWS.db = async () => {
+  const { health: h, rules, runs } = await api('/db-health');
+  DBH_RULES = rules;
+  const own = rules.filter((r) => !r.builtin), built = rules.filter((r) => r.builtin);
+  const last = h.backups.newest, chk = h.last_check, c = h.compact;
+  const line = [`<b>${dbhSize(h.file_bytes)}</b>`, `${dbhNum(h.records)} records`, `last backup ${last ? ago(last.at) + ' ago' : 'none yet'}`, `last check ${chk ? (chk.ok ? 'OK' : 'failed') : 'not run yet'}`].join(' · ');
+  const health = `<section class="pcard" aria-label="Health">
+    <div class="dbh-line">${h.status === 'healthy' ? pill('Healthy', 'ok') : pill('Warning', 'warn')}<span>${line}</span>${info('The database file with its write-ahead log, the newest backup in the backups folder, and the last integrity check. A warning shows when the last check failed or the records grew more than 25% in 7 days.')}</div>
+    ${h.warnings.length ? `<p class="rs-warn">${ic('warn')}<span>${h.warnings.map(esc).join(' ')}</span></p>` : ''}
+    <div class="stats dbh-stats">
+      <div class="stat"><span class="stat-v">${dbhSize(h.file_bytes)}</span><span class="stat-l">Database</span></div>
+      <div class="stat"><span class="stat-v">${dbhSize(h.blob_bytes)}</span><span class="stat-l">Vault store</span></div>
+      <div class="stat"><span class="stat-v">${dbhSize(h.backups.bytes)}</span><span class="stat-l">Backups · ${h.backups.count}</span></div>
+      <div class="stat"><span class="stat-v">${dbhDelta(h.growth.d7)}</span><span class="stat-l">Records, last 7 days</span></div>
+    </div>
+    ${overline('Records by area', h.areas.length, info('Counted each night and kept 400 days; growth shows once there are counts that old.'))}
+    <div class="dbh-areas">${h.areas.map((a) => `<div class="dbh-area"><span>${esc(a.label)}</span><b>${dbhNum(a.rows)}</b><span class="meta">${dbhDelta(a.d7)} · 7 d</span><span class="meta only-d">${dbhDelta(a.d30)} · 30 d</span></div>`).join('')}</div>
+  </section>`;
+  const days = (r) => `<label class="dbh-days"><input class="inp sm w-num" type="number" value="${r.days}" min="${r.min}" max="3650" aria-label="${esc(r.label)}: days" data-dbh-days="${esc(r.key)}"><span class="meta">days</span></label>`;
+  const rule = (r) => row({ title: raw(`${esc(r.label)}${r.manual ? ' ' + pill('By hand', 'info') : ''}${info(`${r.detail} Kept: ${r.keeps}`)}`),
+    meta: r.manual ? `Never runs by itself · older than ${r.days} days` : r.enabled ? `On · older than ${r.days} days` : `Off · at least ${r.min} days`,
+    trail: `${days(r)}${r.manual ? '' : switchBtn(r.label, r.enabled, `data-dbh-switch="${esc(r.key)}"`)}<button type="button" class="btn sm" data-dbh-preview="${esc(r.key)}">${ic('eye')}Preview</button>` });
+  const rulesCard = `<section class="pcard" aria-label="Clean-up rules">${overline('Clean-up rules', own.length, info('A rule that is on runs each night, after a backup. Preview counts what it would remove and changes nothing. Every change and run asks for your password and is recorded in the audit trail.'))}
+    ${own.map(rule).join('')}
+    ${overline('Built in', built.length, info('These always run. Their days can be raised, never lowered below the hub\'s defaults.'))}
+    ${built.map((r) => row({ one: true, title: r.label, trail: `${days(r)}<span class="tag txt">Raise only</span>` })).join('')}
+  </section>`;
+  const maint = `<section class="pcard" aria-label="Maintenance">${overline('Maintenance')}
+    ${row({ lead: ic('check'), title: 'Check integrity', meta: `Quick check each night${chk ? `, last ${chk.ok ? 'OK' : 'failed'} ${dt(chk.at)}` : ''}. The full check reads every page.`, trail: '<button type="button" class="btn sm" id="dbhCheck">Run full check</button>' })}
+    ${row({ lead: ic('rot'), title: 'Compact', meta: c.free == null ? 'Free disk space could not be read, so Compact is not available.' : `Needs ${dbhSize(c.needed)} free (${dbhSize(c.free)} free); writes wait about ${c.seconds} s.`, trail: `<button type="button" class="btn sm" id="dbhCompact"${c.ok ? '' : ' disabled'}>Compact…</button>` })}
+    ${overline('Backups', `${h.backups.count} · ${dbhSize(h.backups.bytes)}`, info('Removed data stays in these backups until they age out, and in the audit archives. Only the hub\'s own account can read the folder.'))}
+    ${kv('Keep', '7 daily · 4 weekly')}${kv('Newest', last ? `<span class="mono">${esc(last.name)}</span>` : '—')}${kv('Audit kept from', h.audit_horizon ? esc(dbhDay(h.audit_horizon)) : 'the start')}
+  </section>`;
+  const runsCard = `<section class="pcard" aria-label="Run history">${overline('Runs', runs.length)}${runs.map(dbhRun).join('') || '<p class="meta">Nothing has run yet.</p>'}</section>`;
+  return {
+    t: `${ic('file')}Database`,
+    b: `<div class="dbh">${health}<div class="dbh-cols">${rulesCard}<div class="dbh-side">${maint}${runsCard}</div></div></div>`,
+    after() {
+      const byKey = (k) => rules.find((r) => r.key === k);
+      const change = (r, ch, anchor, undo) => dbhSheet({ title: ch.enabled === undefined ? `Keep ${r.label} ${ch.days} days?` : `${ch.enabled ? 'Turn on' : 'Turn off'} ${r.label}?`, anchor, goLabel: 'Save', onCancel: undo,
+        body: `<p class="meta">${ch.enabled ? `Each night, after a backup, it removes what is older than ${r.days} days. Preview first to see what that is.` : 'The change is recorded in the audit trail.'}</p>`,
+        go: (proof) => api(`/db-health/rules/${encodeURIComponent(r.key)}`, 'PUT', { ...ch, ...proof }), onDone: () => { toast('Rule saved'); dbhReopen(); } });
+      $$('[data-dbh-switch]').forEach((b) => (b.onclick = (e) => { const r = byKey(b.dataset.dbhSwitch); change(r, { enabled: !r.enabled }, e.currentTarget); }));
+      $$('[data-dbh-days]').forEach((inp) => (inp.onchange = (e) => {
+        const r = byKey(inp.dataset.dbhDays), d = Number(inp.value), undo = () => { inp.value = r.days; };
+        if (!Number.isInteger(d) || d < r.min || d > 3650) { toast(r.builtin ? `${r.label}: at least ${r.min} days` : `${r.label}: ${r.min} to 3650 days`); undo(); return; }
+        if (d !== r.days) change(r, { days: d }, e.currentTarget, undo);
+      }));
+      $$('[data-dbh-preview]').forEach((b) => (b.onclick = (e) => {
+        const r = byKey(b.dataset.dbhPreview);
+        const sh = dbhSheet({ title: r.manual ? `Revoke these suspended keys?` : `Run ${r.label} now?`, anchor: e.currentTarget, bad: true, goLabel: r.manual ? 'Back up and revoke' : 'Back up and remove',
+          body: '<div id="dbhPlan"><span class="faint">Counting records…</span></div><p class="meta">A backup is taken first. The count is taken again at the run, and any difference is shown.</p>',
+          go: (proof) => post(`/db-health/rules/${encodeURIComponent(r.key)}/run`, { ...proof, ...(sh.dataset.total ? { preview_total: Number(sh.dataset.total) } : {}) }),
+          onDone: ({ result: x }) => { toast(`${dbhNum(x.total)} ${r.manual ? 'revoked' : 'removed'}${x.difference ? ` (${dbhDelta(x.difference)} since the preview)` : ''}${x.backup ? ' · backup ' + x.backup : ''}`); dbhReopen(); } });
+        api(`/db-health/rules/${encodeURIComponent(r.key)}/preview`).then(({ preview: p }) => {
+          if (!sh.isConnected) return;
+          sh.dataset.total = String(p.total);
+          const range = p.range.from ? ` from ${esc(dbhDay(p.range.from))} to ${esc(dbhDay(p.range.to))}` : '';
+          $('#dbhPlan', sh).innerHTML = p.refused ? `<p class="rs-warn">${ic('warn')}<span>${esc(p.refused)}</span></p>`
+            : `<div class="rs-sum"><b>${dbhNum(p.total)}</b> ${r.key === 'suspended_keys' ? 'keys to revoke' : 'records'}${range} <span class="meta">· older than ${p.days} days</span></div>
+              <div class="dbh-pv">${p.items ? p.items.map((k) => kv(k.label || k.id, `${esc(k.agent || 'no agent')} · suspended ${esc(dbhDay(k.suspended_at))}`)).join('') : p.tables.map((t) => kv(dbhTable(t.table), dbhNum(t.rows))).join('')}</div><p class="meta">Kept: ${esc(p.keeps)}</p>`;
+          if (p.refused || !p.total) $$('.fld, #dbhGo', sh).forEach((x) => { x.hidden = true; });
+        }, () => { if (sh.isConnected) $('#dbhPlan', sh).innerHTML = '<span class="err">Could not count the records.</span>'; });
+      }));
+      $('#dbhCheck').onclick = () => run(async () => { const { check: x } = await post('/db-health/check', { full: true }); toast(x.ok ? 'Full check: OK' : 'Full check failed: ' + x.result.join('; ')); dbhReopen(); });
+      $('#dbhCompact').onclick = (e) => dbhSheet({ title: 'Compact the database?', anchor: e.currentTarget, goLabel: 'Compact',
+        body: `<p class="meta">Gives back the space clean-up runs freed. Writes wait while it runs, about ${c.seconds} s.</p>`,
+        go: (proof) => post('/db-health/compact', proof), onDone: ({ compact: x }) => { toast(`Compacted: ${dbhSize(x.saved)} back`); dbhReopen(); } });
+    },
+  };
+};
+
 /* ---------- account menu: opens beside the avatar that was clicked ---------- */
 async function signOut() { await post('/logout'); S.me = null; csrf = ''; closeMe(); closeD(); showLogin(); }
 function closeMe() {
@@ -11893,17 +12107,18 @@ const coAlertTeam = (a, d) => alertTeam(a, d) || S.teams.find((x) => x.id === d.
    POST /needs-you/act, which checks the version and the decider again; an action that needs its own screen opens it.
    A For awareness row can be dismissed by this viewer for its current episode. Shared by both consoles (pfx names the
    click attribute: data-ny here, data-mu-ny in the member console). */
-const NY_KIND = { undelivered: ['Not delivered yet', 'clock'], overdue: ['Past its check-in time', 'warn'], question: ['Question for you', 'dec'], relayed_answer: ['Relayed answer', 'dec'], access_request: ['Access request', 'key'], checkpoint: ['Waits for your approval', 'check'],
+const NY_KIND = { undelivered: ['Not delivered yet', 'clock'], overdue: ['Past its check-in time', 'warn'], question: ['Question for you', 'dec'], relayed_answer: ['Relayed answer', 'dec'], design: ['Design to decide', 'dec'], access_request: ['Access request', 'key'], checkpoint: ['Waits for your approval', 'check'],
   unblock: ['Task blocked', 'ban'], refine_waiting: ['Refining requirements', 'graph'], proposal: ['Blueprint change', 'graph'], backlog: ['New brief', 'note'], onboarding: ['Team request', 'team'], checkout: ['Checkout step', 'pc'],
   directive: ['Directive to review', 'sl'], directive_suggestion: ['Suggestion from an agent', 'sl'], feedback: ['New feedback', 'bug'], vault_conflict: ['Vault conflict', 'note'], unclear: ['Unclear requirement', 'info'],
   team_pause: ['Team paused', 'pause'], setup: ['Team setup', 'team'], team_paused: ['Team paused', 'pause'],
-  stalled: ['Member stalled', 'clock'], missed_milestone: ['Milestone missed', 'warn'], claim_not_supported: ['Claim not supported', 'warn'], keys_not_collected: ['Keys not collected', 'key'], key_handover: ['Waiting for the PC user', 'key'], key_leak_unfinished: ['Leak rotation not finished', 'warn'], rules_applied: ['Applied by rules', 'check'], blocking_work: ['Blocks work', 'warn'] };
+  stalled: ['Member stalled', 'clock'], missed_milestone: ['Milestone missed', 'warn'], claim_not_supported: ['Claim not supported', 'warn'], keys_not_collected: ['Keys not collected', 'key'], paired: ['Paired just now', 'pc'], key_handover: ['Waiting for the PC user', 'key'], key_leak_unfinished: ['Leak rotation not finished', 'warn'], rules_applied: ['Applied by rules', 'check'], blocking_work: ['Blocks work', 'warn'] };
 const nyKind = (k) => NY_KIND[k] || [cap(String(k).replace(/_/g, ' ')), 'info'];
 /* Where a row's record opens in the operator's console. */
 function nyOpenAttr(o) {
   const e = (s) => esc(s ?? '');
   switch (o.kind) {
     case 'question': return `data-dec="${e(o.id)}"`;
+    case 'design': return `data-design="${e(o.id)}"`;
     case 'request': return 'data-go="req"';
     case 'task': return `data-task="${e(o.team_id)}|${e(o.id)}"`;
     case 'proposal': return `data-bpv="${e(bpArg(o.project_id, 'prop', o.team_id || ''))}"`;
@@ -11919,6 +12134,7 @@ function nyOpenAttr(o) {
     case 'team': return `data-team="${e(o.id)}"`;
     case 'rules': return `data-go="rules" data-arg="${e(o.team_id)}"`;
     case 'setup': return `data-ob-setup="${e(o.id)}" data-ob-team="${e(o.team_id)}"`;
+    case 'pc': return `data-pc="${e(o.id)}"`;
     case 'questions': return `data-bpv="${e(bpArg(o.project_id, 'q', o.team_id || ''))}"`;
     default: return '';
   }
@@ -11931,7 +12147,7 @@ function nyBtns(r, open = nyOpenAttr, pfx = 'ny', sm = true, later = true) {
   if (r.kind === 'unclear' && r.item) return `<button type="button" class="btn${sm ? ' sm' : ''} pri" data-clarify="${esc(bpItemArg(r.item.project_id, r.item.key))}" aria-label="${esc(`Clarify: ${r.title}`)}">Clarify</button>` + (later ? nyLaterBtn(r, pfx, sm) : '');
   const inp = r.actions.find((a) => a.input), o = open(r.open), s = sm ? ' sm' : '', go = inp ? inp.label : 'Open';
   return (o ? `<button type="button" class="btn${s}${inp ? ' pri' : ''}" ${o} aria-label="${esc(`${go}: ${r.title}`)}">${esc(go)}</button>` : '')
-    + r.actions.filter((a) => !a.input).map((a) => `<button type="button" class="btn${s}${a.tone === 'ok' ? ' ok' : ''}" data-${pfx}="${esc(`${r.id}|${r.source.version}|${a.id}`)}" aria-label="${esc(`${a.label}: ${r.title}`)}">${esc(a.label)}</button>`).join('')
+    + r.actions.filter((a) => !a.input).map((a) => `<button type="button" class="btn${s}${a.tone === 'ok' ? ' ok' : ''}" data-${pfx}="${esc(`${r.id}|${r.source.version}|${a.id}`)}"${nyActAttrs(a)} aria-label="${esc(`${a.label}: ${r.title}`)}">${esc(a.label)}</button>`).join('')
     + (later ? nyLaterBtn(r, pfx, sm) : '');
 }
 /* A row set aside with Later (SPEC-ATTENTION-05): when it comes back, and Bring back now. */
@@ -11976,7 +12192,9 @@ function nyOpsLine(ops) {
 const nyReplyBtn = (label = 'Reply…') => `<button type="button" class="btn" data-ny-reply aria-expanded="false">${esc(label)}</button>`;
 const nyReplyBox = (ph, send) => `<div class="ny-reply" data-ny-reply-box hidden><textarea class="inp" data-ny-note rows="2" maxlength="2000" placeholder="${esc(ph)}" aria-label="${esc(ph)}"></textarea><div class="ny-acts">${send}<button type="button" class="btn" data-ny-reply-x>Cancel</button></div></div>`;
 const nyOpenBtn = (r, open, label, cls = '') => { const o = open(r.open); return o ? `<button type="button" class="btn${cls}" ${o} aria-label="${esc(`${label}: ${r.title}`)}">${esc(label)}</button>` : ''; };
-const nyActBtn = (r, a, pfx, cls = '') => `<button type="button" class="btn${cls}" data-${pfx}="${esc(`${r.id}|${r.source.version}|${a.id}`)}" aria-label="${esc(`${a.label}: ${r.title}`)}">${esc(a.label)}</button>`;
+/* An action the hub marks with confirm asks that question once before it acts; done is what its toast says happened. */
+const nyActAttrs = (a) => `${a.confirm ? ` data-ny-confirm="${esc(a.confirm)}"` : ''}${a.done ? ` data-ny-done="${esc(a.done)}"` : ''}`;
+const nyActBtn = (r, a, pfx, cls = '') => `<button type="button" class="btn${cls}" data-${pfx}="${esc(`${r.id}|${r.source.version}|${a.id}`)}"${nyActAttrs(a)} aria-label="${esc(`${a.label}: ${r.title}`)}">${esc(a.label)}</button>`;
 /* A card's parts by kind: the summary under the title (three lines at most), context, extra meta, the visible buttons (the
    main decision first, at most three) and the rest, which the ⋯ menu lists. */
 function nyBody(r, open, pfx) {
@@ -11995,6 +12213,11 @@ function nyBody(r, open, pfx) {
   if ((r.kind === 'undelivered' || r.kind === 'overdue') && r.open?.kind === 'task') {
     const re = r.actions.some((a) => a.id === 'reassign') ? `<button type="button" class="btn pri" data-reassign="${esc(r.open.team_id + '|' + r.open.id)}" aria-label="${esc(`Reassign: ${r.title}`)}">Reassign</button>` : '';
     return { sum: esc(nyOffline(r, r.summary || r.reason || '')), ctx: '', meta: [], acts: [re, nyOpenBtn(r, open, 'Open task', re ? '' : ' pri')].filter(Boolean), more: [] };
+  }
+  // A design to decide: the question and the review in a line, one button for its screen; a relayed answer also has Confirm.
+  if (r.kind === 'design') {
+    const rv = r.design?.review, [one] = r.actions.filter((a) => !a.input);
+    return { sum: mdText(r.summary || ''), ctx: '', meta: [rv ? (rv === 'out of date' ? 'Review out of date' : `Review: ${rv}`) : 'Not reviewed', r.design?.key].filter(Boolean), acts: [nyOpenBtn(r, open, one ? 'Review' : 'Decide', ' pri'), one ? nyActBtn(r, one, pfx) : ''], more: [] };
   }
   if (r.kind === 'proposal' && d?.kind === 'proposal') {
     const [a1, ...an] = r.actions.filter((a) => !a.input);
@@ -12149,7 +12372,7 @@ function nyAct(b, val, after) {
   const send = async (note) => {
     try {
       const r = await post('/needs-you/act', { id, version, action, ...(note ? { note } : {}), ...(here ? { filter } : {}) });
-      toast(`${label} · ${r.total ? `${r.total} still ${r.total === 1 ? 'needs' : 'need'} you${here}` : `nothing else needs you${here}`}`);
+      toast(`${b.dataset.nyDone || label} · ${r.total ? `${r.total} still ${r.total === 1 ? 'needs' : 'need'} you${here}` : `nothing else needs you${here}`}`);
     } catch (e) { if (e.status !== 409) throw e; toast(e.message, true); }
     await after(); nyFocus(box, at);
   };
@@ -12166,6 +12389,10 @@ function nyAct(b, val, after) {
     return fbSheet({ title: `${label}: ${trunc(b.closest('[data-ny-row]')?.querySelector('.lrow-title, .alert-msg, .ny-msg')?.textContent || '', 60)}`, anchor, label, tone: action === 'unblock' ? 'pri' : 'bad', fields: fbArea('nyNote', NY_NOTE[action], 2000),
       onGo: async (sh) => { const note = fbVal(sh, 'nyNote'); if (action === 'unblock' && !note) return ['Say what changed, so the team can go on.', 'nyNote']; await send(note); } });
   }
+  if (b.dataset.nyConfirm) {
+    const anchor = (b.closest('[hidden]') && b.closest('[data-ny-row]')?.querySelector('[data-ny-more]')) || b;
+    return fbSheet({ title: b.dataset.nyConfirm, anchor, label, tone: 'bad', fields: '', onGo: async () => { await send(); } });
+  }
   return run(async () => { b.disabled = true; try { await send(); } finally { b.disabled = false; } });
 }
 /* Dismiss a For awareness row for this viewer and its current episode; nothing else changes. */
@@ -12174,7 +12401,7 @@ function nyDismiss(b, val, after) {
   return run(async () => {
     b.disabled = true;
     try { await post('/needs-you/dismiss', { record: val.slice(0, i), episode: val.slice(i + 1) }); toast('Dismissed for you'); }
-    catch (e) { if (e.status !== 409 && e.status !== 404) throw e; toast(e.message, true); } finally { b.disabled = false; }
+    catch (e) { if (![400, 404, 409].includes(e.status)) throw e; toast(e.message, true); } finally { b.disabled = false; }
     await after(); nyFocus(box, at);
   });
 }
@@ -12228,6 +12455,54 @@ async function nyAfter() {
   if (!SHEET && (DR.type === 'team' || DR.type === 'blueprint' || DR.type === 'needs')) await openD(DR.type, DR.arg, true);
   refresh();
 }
+/* A design to decide (docs/decisions.md, Designs): the question's own screen, opened from its Needs you row. The design is
+   agent text (marked as such), the review is the reviewer's and says whether it was independent, the mockups are images the
+   hub vouched for (PNG, JPEG, WebP, never SVG). The bottom bar answers it; after a decision one step keeps or archives it. */
+const designPill = (rv) => (!rv ? '<span class="pill idle">Not reviewed</span>' : rv.stale ? '<span class="pill warn">Review is out of date</span>' : `<span class="pill ${rv.verdict === 'approved' ? 'ok' : 'warn'}">${esc(rv.verdict === 'approved' ? 'Approved' : plural(rv.changes.length || 1, 'change') + ' asked')}</span>`);
+async function designOpen(id) { const r = await api(`/decisions/${encodeURIComponent(id)}/design`); designDraw(r.design, r.decision, `/decisions/${encodeURIComponent(id)}`); }
+/* The same screen read-only, from the Blueprint's Designs filter: no question, so no answers; archive and unarchive stay. */
+async function designItem(pid, key) { const r = await api(`/projects/${encodeURIComponent(pid)}/designs/${encodeURIComponent(key)}`); designDraw(r.design, null, ''); }
+function designDraw(g, d, base) {
+  const rv = g.review, open = !!d && DEC_OPEN.includes(d.status), relay = !!d && d.status === 'answered' && d.relay_state === 'pending';
+  const opts = [...(d?.options || [])].sort((a, b) => (b.key === d.recommended) - (a.key === d.recommended));
+  const mock = g.mockups.map((m) => `<figure class="ds-mock"><a href="${g.mock}/${m.n}" target="_blank" rel="noopener"><img src="${g.mock}/${m.n}" alt="${esc(m.caption || m.name)}" loading="lazy"></a>${m.caption ? `<figcaption>${esc(m.caption)}</figcaption>` : ''}</figure>`).join('');
+  const review = !rv ? `<p class="meta">Nobody has reviewed this design.</p>` : `<div class="ds-rv">${designPill(rv)}<span class="meta">Reviewed by ${esc(rv.by || 'an agent')}${rv.stale ? ', then changed after the review' : ''}${rv.independent ? '' : ' · the same agent that wrote it, so not an independent review'}</span></div>`
+    + (rv.summary ? `<p class="ds-rvs">${esc(rv.summary)}</p>` : '') + (rv.changes.length ? `<p class="meta">What changed after review</p><ul class="ds-ch">${rv.changes.map((c) => `<li>${esc(c)}</li>`).join('')}</ul>` : '');
+  const rec = opts.find((o) => o.key === d?.recommended);
+  const head = d ? `<p class="ds-q">${esc(d.question)}</p>` + (rec ? `<p class="meta ds-rec">${ic('check')}${esc(d.agent_label || g.asked_by || 'The agent')} recommends <b>${esc(rec.label)}</b>${rec.effect ? ` · ${esc(rec.effect)}` : ''}</p>` : '') : '';
+  const settled = open || !d ? '' : `<p class="ds-done">${esc(d.status === 'answered' ? decAnswer(d) : (DEC_ST[d.status] || [d.status])[0])}</p>`;
+  const bar = relay ? `<button type="button" class="btn pri" data-ds="confirm">Confirm</button><button type="button" class="btn" data-ds="overturn">Overturn…</button>`
+    : open ? opts.map((o, i) => `<button type="button" class="btn${i ? '' : ' pri'}" data-ds="opt" data-ds-key="${esc(o.key)}" title="${esc(o.effect || '')}">${esc(o.label)}</button>`).join('') + `<button type="button" class="btn" data-ds="change">Change…</button><button type="button" class="btn bad" data-ds="reject">Reject…</button>`
+    : (g.may_archive ? `<button type="button" class="btn" data-ds="${g.archived ? 'unarchive' : 'archive'}">${g.archived ? 'Unarchive the design' : 'Archive the design'}</button>` : '') + '<button type="button" class="btn pri" data-sheet-close>Done</button>';
+  const sh = openSheet({ title: `Design to decide · ${g.title}`, cls: 'wide ds', html: `<div class="ds-body">${head}<div class="ds-meta">${designPill(rv)}<span class="meta">${esc(g.key)} · ${esc(g.status)}${g.archived ? ' · archived' : ''}</span></div>${settled}
+    <section class="ds-sec"><h3 class="overline">Review</h3>${review}</section>${mock ? `<section class="ds-sec"><h3 class="overline">Mockups</h3><div class="ds-mocks">${mock}</div></section>` : ''}
+    <section class="ds-sec"><h3 class="overline">The design <span class="meta">written by ${esc(g.written_by || 'an agent')} · agent text</span></h3><article class="md prose ds-doc">${mdDoc(g.body || '')}</article></section></div>
+    <div class="ds-bar" id="dsBar">${bar}</div><div class="ds-note" id="dsNote" hidden></div>` });
+  const done = async (msg) => { toast(msg); closeSheet(); await (MU.on ? muDraw(false) : nyAfter()); };
+  // Change… and Reject… ask for words first, in the bar's place; the others act at once.
+  const ask = (kind) => { const n = $('#dsNote', sh), rej = kind === 'reject';
+    n.hidden = false; n.innerHTML = `<label class="fld"><span class="vlabel">${rej ? 'Why is it rejected? (the team reads this)' : 'What should change? (the team reads this)'}</span><textarea class="inp" id="dsTxt" rows="3" maxlength="2000"></textarea></label><span class="err" id="dsErr" role="alert"></span><div class="ny-acts"><button type="button" class="btn${rej ? ' bad' : ' pri'}" data-ds="${kind}-go">${rej ? 'Reject the design' : 'Send to the team'}</button><button type="button" class="btn" data-ds="note-x">Cancel</button></div>`; $('#dsTxt', sh).focus(); };
+  sh.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-ds]'); if (!b) return; const a = b.dataset.ds, txt = () => ($('#dsTxt', sh)?.value || '').trim();
+    const go = (fn) => run(async () => { b.disabled = true; try { await fn(); } catch (x) { b.disabled = false; throw x; } });
+    if (a === 'opt') return go(async () => { await post(base + '/answer', { option: b.dataset.dsKey, options_version: d?.options_version }); await keepStep(); });
+    if (a === 'confirm') return go(async () => { await post(base + '/confirm', {}); await keepStep(); });
+    if (a === 'overturn' || a === 'change' || a === 'reject') return ask(a);
+    if (a === 'note-x') { $('#dsNote', sh).hidden = true; return; }
+    const need = (m) => { if (txt()) return false; $('#dsErr', sh).textContent = m; $('#dsTxt', sh).focus(); return true; };
+    if (a === 'change-go') { if (need('Say what should change.')) return; return go(async () => { await post(base + '/more-info', { note: txt() }); await done('Sent back to the team'); }); }
+    if (a === 'reject-go') { if (need('Say why, so the team knows.')) return; return go(async () => { await post(base + '/answer', { reject: true, text: txt() }); await keepStep(); }); }
+    if (a === 'overturn-go') { if (need('Say what the answer is.')) return; return go(async () => { await post(base + '/overturn', { text: txt() }); await keepStep(); }); }
+    if (a === 'archive' || a === 'unarchive') return go(async () => { await post(`/projects/${encodeURIComponent(g.project_id)}/items/${encodeURIComponent(g.key)}/${a}`, {}); await done(a === 'archive' ? 'Design archived' : 'Design back in the Blueprint'); });
+  });
+  // After a decision: one step, keep the design (the default, nothing to do) or archive it (admin only).
+  const keepStep = async () => {
+    toast('Decision recorded');
+    if (!g.may_archive && MU.on) { await done('Decision recorded'); return; }
+    $('#dsBar', sh).innerHTML = `<p class="meta ds-keep">The decision is recorded. Keep the design in the Blueprint, or archive it?</p>${g.project_id && !MU.on ? `<button type="button" class="btn" data-ds="archive">Archive the design</button>` : ''}<button type="button" class="btn pri" id="dsKeep">Keep the design</button>`;
+    $('#dsNote', sh).hidden = true; $('#dsKeep', sh).onclick = () => done('Design kept'); $('#dsKeep', sh).focus();
+  };
+}
 function urgent() {
   const ny = S.ny?.items || [], aw = S.ny?.awareness?.items || [], covered = new Set([...ny, ...(S.ny?.later?.items || [])].map((r) => r.source.id));
   // A workflow alert is not shown again beside its Needs you row, nor while this viewer set that row aside (Later); stalls show under For awareness, where the team switched them on.
@@ -12240,7 +12515,9 @@ function urgent() {
   L.forEach((x) => { x.g = 'alert'; });
   const tmN = (id) => (id ? S.teams.find((x) => x.id === id)?.name || '' : '');
   // Needs you, oldest waiting first, then For awareness newest first (ts orders newest first).
-  for (const r of ny) { const [l, i] = nyKind(r.kind); L.push({ id: r.id, g: 'ny', s: 'warn', r: 1, ts: -r.at, ico: i, ttl: l, tag: tmN(r.scope.team_id), msg: [r.title, nyUntil(r), nySum(r)].filter(Boolean).join(' · '), btns: nyBtns(r, nyOpenAttr, 'ny', false),
+  for (const r of ny) { const [l, i] = nyKind(r.kind); L.push({ id: r.id, g: 'ny', s: 'warn', r: 1, ts: -r.at, ico: i, ttl: l, tag: tmN(r.scope.team_id), full: r.kind === 'paired',
+    // A PC that paired: its address, connector version and platform first, then the warning, all of it (the banner wraps).
+    msg: (r.kind === 'paired' ? [r.title, r.reason, r.summary] : [r.title, nyUntil(r), nySum(r)]).filter(Boolean).join(' · '), btns: nyBtns(r, nyOpenAttr, 'ny', false),
     ...(r.kind === 'question' && r.detail?.kind === 'question' ? { card: r } : {}) }); }
   for (const r of aw) { const [l, i] = nyKind(r.kind); L.push({ id: r.id, g: 'aw', s: 'info', r: 4, ts: r.at, ico: i, ttl: l, tag: tmN(r.scope.team_id), msg: [r.title, nyUntil(r), nySum(r)].filter(Boolean).join(' · '), btns: awBtns(r, nyOpenAttr, 'ny', false) }); }
   for (const p of S.pcs) { const e = S.obPc?.get(p.id)?.enrolment; if (e?.status === 'unused') L.push({ id: 'obc' + p.id, g: 'alert', s: 'info', r: 5, ts: e.created_at, ico: 'pc', ttl: 'Code not used yet', tag: p.name, msg: `The prompt for ${p.name} has not been run · ${ago(e.created_at)}`, btns: bt('Open PC', `data-pc="${esc(p.id)}"`, 'pri') }); }
@@ -12275,7 +12552,7 @@ function renderAlerts(full = true) {
   const moreMeta = [nN ? `${nN} ${nN === 1 ? 'needs' : 'need'} you` : '', aN ? `${aN} for awareness` : '', oN ? plural(oN, 'alert') : '', S.ny?.later?.total ? `${S.ny.later.total} later` : ''].filter(Boolean).join(' · ');
   // A failed read: a row that says so, above any alert, and never "Nothing needs you".
   const nyErr = S.nyErr ? `<div class="card card-row ny-err" role="status">${row({ lead: ic('warn'), title: 'Could not check what needs you', meta: 'The hub did not answer · it tries again in 10 s', chev: true, attrs: { 'data-go': 'needs' } })}</div>` : '';
-  box.innerHTML = nyErr + (!a ? (lt && !S.nyErr ? `<div class="card card-row">${row({ title: 'Nothing needs you', meta: `${lt} later`, chev: true, attrs: { 'data-go': 'needs', 'data-arg': 's=later' } })}</div>` : '') : (a.card ? nyQCard(a.card) : `<div class="alert${a.s === 'crit' ? ' bad' : a.s === 'info' ? ' info' : ''}" role="group" aria-label="Most urgent" data-ny-row="${esc(a.id)}"><div class="alert-hd"><span class="alert-ico">${ic(a.ico)}</span><span class="alert-title">${esc(a.ttl)}</span>${a.tag ? `<span class="tag">${esc(trunc(a.tag, 28))}</span>` : ''}</div><p class="alert-msg">${mdText(a.msg)}</p><div class="alert-acts">${a.btns}</div></div>`)
+  box.innerHTML = nyErr + (!a ? (lt && !S.nyErr ? `<div class="card card-row">${row({ title: 'Nothing needs you', meta: `${lt} later`, chev: true, attrs: { 'data-go': 'needs', 'data-arg': 's=later' } })}</div>` : '') : (a.card ? nyQCard(a.card) : `<div class="alert${a.s === 'crit' ? ' bad' : a.s === 'info' ? ' info' : ''}${a.full ? ' full' : ''}" role="group" aria-label="Most urgent" data-ny-row="${esc(a.id)}"><div class="alert-hd"><span class="alert-ico">${ic(a.ico)}</span><span class="alert-title">${esc(a.ttl)}</span>${a.tag ? `<span class="tag">${esc(trunc(a.tag, 28))}</span>` : ''}</div><p class="alert-msg">${mdText(a.msg)}</p><div class="alert-acts">${a.btns}</div></div>`)
     + (L.length > 1 || (a && S.ny?.later?.total) ? `<div class="card card-row">${row({ title: L.length > 1 ? `${L.length - 1} more` : 'Set aside', meta: moreMeta, chev: true, attrs: { 'data-go': 'needs', ...(L.length > 1 ? {} : { 'data-arg': 's=later' }) } })}</div>` : ''));
 }
 
@@ -13552,7 +13829,8 @@ VIEWS.req = async (tab = 'req') => {
         return row({ lead: ic('clock'), title: raw(`<span class="mono" title="${esc(g.resource)}">${esc(midTrunc(g.resource, 40))}</span>`),
           meta: `${g.actions.map((a) => ACTN[a] || a.replace('fs.', '')).join(', ')}${k ? ' · ' + keyName(k) : ''} · ${left(g.not_after)} left`,
           trail: `<button type="button" class="btn sm" data-gr="${esc(g.id)}" aria-label="Revoke grant">${ic('trash')}Revoke</button>` }); }).join('') || none('clock', 'No temporary grants')}</div>`,
-      after() { $$('[data-gr]').forEach((b) => arm(b, () => run(async () => { await api('/grants/' + b.dataset.gr, 'DELETE'); toast('Revoked'); reopen(); }))); } };
+      after() { const byId = new Map(G.map((g) => [g.id, g]));
+        $$('[data-gr]').forEach((b) => arm(b, () => run(async () => { await api('/grants/' + b.dataset.gr, 'DELETE'); toast(`Grant revoked: ${midTrunc(byId.get(b.dataset.gr)?.resource || '', 40)}`); reopen(); }), 'Revoke? Access ends now')); } };
   }
   const all = (await api('/requests')).requests, P = all.filter((r) => r.status === 'pending'), D = all.filter((r) => r.status !== 'pending').slice(0, 12);
   return {
@@ -13613,14 +13891,14 @@ const SH_KIND = { inline: 'Through the hub', channel: 'Over a channel', bridge: 
 VIEWS.share = async (id) => {
   const sp = '/shares/' + encodeURIComponent(id);
   const [{ share: s }, V, F] = await Promise.all([api(sp), api(`${sp}/versions`), api(`${sp}/feedback`)]);
-  const revoke = () => run(async () => { await post(`${sp}/revoke`); toast('Revoked'); reopen(); });
+  const revoke = () => run(async () => { await post(`${sp}/revoke`); toast(`Share revoked: ${s.name}`); reopen(); });
   const del = () => run(async () => { await api(sp, 'DELETE'); toast('Deleted'); DR.stack.length ? back() : openD('shares', null, true); });
   const who = shWho(s.recipients);
   return {
     t: `${ic('link')}<span class="ellip">${esc(s.name)}</span>${stPill(s.status)}`,
     here: { label: s.name, meta: `${cap(s.status.replace('_', ' '))} · ${s.author_label || 'Unknown author'}` },
     dbar: { title: s.name,
-      menu: [s.status !== 'revoked' ? { label: 'Revoke share', icon: 'ban', bad: true, confirm: 'Tap again to revoke', fn: revoke } : null, { label: 'Delete share', icon: 'trash', bad: true, confirm: 'Tap again to delete', fn: del }] },
+      menu: [s.status !== 'revoked' ? { label: 'Revoke share', icon: 'ban', bad: true, confirm: 'Revoke? Recipients lose access', fn: revoke } : null, { label: 'Delete share', icon: 'trash', bad: true, confirm: 'Tap again to delete', fn: del }] },
     b: `<div class="pcard kvc">${kv('Author', esc(s.author_label || '—'))}${kv('Recipients', `<span title="${esc(who)}">${esc(who || '—')}</span>`)}${kv('Updated', esc(dt(s.updated_at)))}</div>` +
       `<div class="pcard">${overline('Versions', V.versions.length)}${V.versions.slice().reverse().map((v) => `<div class="vers">${row({ group: true, expanded: false, title: `v${v.version}`, meta: `${SH_KIND[v.upload_kind] || v.upload_kind} · ${plural(v.files.length, 'file')} · ${chBytes(v.total_bytes)} · ${ago(v.created_at)} ago`, trail: stPill(v.status), attrs: { 'data-vtoggle': '' } })}<div class="vfiles" hidden>${v.note ? `<p class="rq-why">${esc(v.note)}</p>` : ''}${v.files.slice(0, 50).map((f) => row({ one: true, lead: ic('file'), title: raw(`<span class="mono" title="${esc(f.path)}">${esc(midTrunc(f.path, 40))}</span>`), trail: `<span>${chBytes(f.size)}</span>` })).join('')}</div></div>`).join('')}</div>` +
       (F.feedback.length ? `<div class="pcard">${overline('Feedback', F.feedback.length)}${F.feedback.map((f) => `<div class="fb"><div class="rq-hd"><span class="rq-who">${esc(f.author_label || 'Unknown')}</span><span class="meta">${esc(f.kind)} · v${f.version} · ${esc(f.status)} · ${ago(f.created_at)} ago</span></div>${f.path ? `<span class="mono rq-res">${esc(f.path)}${f.line ? ':' + esc(f.line) : ''}</span>` : ''}<p class="rq-why">${esc(f.body)}</p></div>`).join('')}</div>` : '') +
@@ -13629,7 +13907,7 @@ VIEWS.share = async (id) => {
         ${dz('trash', 'Delete share', 'Removes the share and every version. It cannot be undone.', '<button type="button" class="btn sm" id="shD">Delete share</button>')}</div>`,
     after() {
       $$('[data-vtoggle]').forEach((b) => (b.onclick = () => { const open = b.getAttribute('aria-expanded') !== 'true'; b.setAttribute('aria-expanded', String(open)); b.parentElement.querySelector('.vfiles').hidden = !open; }));
-      const r = $('#shR'); r && arm(r, revoke, 'Yes, revoke');
+      const r = $('#shR'); r && arm(r, revoke, 'Revoke? Recipients lose access');
       arm($('#shD'), del, 'Yes, delete');
     },
   };
@@ -14028,6 +14306,8 @@ document.addEventListener('click', (e) => {
   if (!t.closest('#meMenu')) closeMe();
   const c = t.closest('[data-copy]'); if (c) { const v = c.closest('[data-v]'); const once = ONCE && ONCE.el.contains(c) ? ONCE : null; copy(v ? v.dataset.v : c.dataset.copy, () => { if (once && ONCE === once) once.copied = true; }); return; }
   // A Needs you row's one-click actions and dismissals (Home, the Needs you screen, a team or Blueprint page).
+  const dsg = t.closest('[data-design]'); if (dsg) { run(() => designOpen(dsg.dataset.design)); return; }
+  const dsi = t.closest('[data-design-item]'); if (dsi) { const [p, k] = dsi.dataset.designItem.split('|'); run(() => designItem(p, k)); return; }
   const nyq = t.closest('[data-ny-qdet-btn]'); if (nyq) { nyQDet(nyq); return; }
   const nyg = t.closest('[data-ny-grp-btn]'); if (nyg) { nyGrpToggle(nyg); return; }
   const nyr = t.closest('[data-ny-reply]'); if (nyr) { nyReply(nyr); return; }

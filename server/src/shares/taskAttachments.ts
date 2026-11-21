@@ -84,6 +84,45 @@ export const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'
 
 const err = (c: string, m: string) => new KeyError(c, m);
 
+/** One file a task upload delivered, as the hub stored it. */
+export interface ReceivedFile { name: string; size: number; sha256: string }
+/** One task upload from the PC as task_list shows it (TaskAttachments.uploads). */
+export interface UploadView {
+  role: AttachRole; state: 'uploading' | 'received' | 'failed'; started_at: number; finished_at: number | null;
+  files: { name: string; size?: number; sha256?: string }[]; reason?: string;
+}
+/** A failed upload's reason: the hub's fixed words for the channel's code, never the message (which may quote a path). */
+const UPLOAD_REASONS: Record<string, string> = {
+  too_large: 'A file or the set was over the size limit.',
+  invalid_argument: 'A file name or type was refused.',
+  denied: 'The task ended or changed hands, or you may no longer change these files.',
+  invalid_state: 'The task ended or changed hands, or you may no longer change these files.',
+  conflict: 'The task ended or changed hands, or you may no longer change these files.',
+  lockdown: 'A lockdown stopped it.',
+  paused: 'The team is paused.',
+  idle: 'The upload stopped before it finished and timed out.',
+  expired: 'The upload stopped before it finished and timed out.',
+  closed_by_sender: 'The upload was closed before it finished.',
+  closed_by_peer: 'The upload was closed before it finished.',
+  closed: 'The upload was closed before it finished.',
+  restart: 'The hub restarted during the upload.',
+  hash_mismatch: 'The bytes that arrived did not match what the PC sent.',
+  size_mismatch: 'The bytes that arrived did not match what the PC sent.',
+  leak_guard: 'The leak guard refused a file.',
+  bridge_error: 'The PC could not read or send a file.',
+};
+export function uploadReason(code: string | null): string {
+  const k = (code ?? '').split(':')[0]!.trim();
+  return UPLOAD_REASONS[k] ?? 'The upload did not finish.';
+}
+/** The names an upload sent: the last part of each path the call gave (never the PC path itself). */
+function sentNames(fromLocalPath: string | null): string[] {
+  if (!fromLocalPath) return [];
+  let paths: unknown;
+  try { paths = JSON.parse(fromLocalPath); } catch { paths = [fromLocalPath]; }
+  return (Array.isArray(paths) ? paths : [paths]).map((p) => String(p).split(/[\\/]/).filter(Boolean).pop() ?? '').filter(Boolean);
+}
+
 export class TaskAttachments {
   /** Set in app.ts: a lockdown refuses new attachments, as it refuses a share upload. */
   lockdown: Lockdown | null = null;
@@ -373,7 +412,7 @@ export class TaskAttachments {
    * bytes, sizes, the set's, task's and team's limits), then commit writes the set's next version and audits it with the
    * channel. A submission's files make a new round; when the task is in review on that submission, it names that round.
    */
-  async commitUpload(c: TaskUpload, files: { path: string; bytes: Buffer }[]): Promise<{ task_id: string; role: AttachRole; share_id: string; version: number; files: number; total_bytes: number }> {
+  async commitUpload(c: TaskUpload, files: { path: string; bytes: Buffer }[]): Promise<{ task_id: string; role: AttachRole; share_id: string; version: number; files: number; total_bytes: number; received: ReceivedFile[] }> {
     const { t, role, w } = this.uploadOf(c);
     if (!t) throw err('denied', 'The task no longer exists.');
     if (!files.length) throw err('invalid_argument', 'The upload held no files.');
@@ -395,7 +434,34 @@ export class TaskAttachments {
         // The submission names its files' round; the task's version stays, so a verdict already being written still lands.
         this.db.prepare('UPDATE tasks SET share_id=?, share_version=?, updated_at=? WHERE id=?').run(set.share_id, set.version, Date.now(), cur.id);
       }
-      return { task_id: cur.id, role, share_id: set.share_id, version: set.version, files: entries.length, total_bytes: bytes };
+      // What landed, as the hub stored it: each file's name, size and sha256 of its bytes (the task's upload state shows these).
+      const received = entries.map((e) => ({ name: e.path, size: e.size, sha256: e.blob_hash.replace(/^sha256:/, '') }));
+      return { task_id: cur.id, role, share_id: set.share_id, version: set.version, files: entries.length, total_bytes: bytes, received };
+    });
+  }
+  /**
+   * The task's uploads from the PC, newest first, for task_list (docs/transfers.md, "State on the task"): each upload's set,
+   * state and files. Received files carry the size and sha256 the hub computed as they landed; an upload still open past its
+   * channel's expiry counts as failed even before the sweep ends it, so none shows "uploading" for ever. The reason is the
+   * hub's fixed wording for the channel's code, never a message; the names are the uploader's text (L2). No channel id, token
+   * or PC path. The caller checks mayRead first.
+   */
+  uploads(taskId: string, now = Date.now(), limit = 20): UploadView[] {
+    const rows = this.db.prepare(`SELECT target, status, failure_reason, result, from_local_path, created_at, finished_at, expires_at FROM data_channels
+      WHERE opened_with='task_attach' AND target IN (?,?) ORDER BY created_at DESC, rowid DESC LIMIT ?`)
+      .all(TaskAttachments.uploadTarget(taskId, 'brief'), TaskAttachments.uploadTarget(taskId, 'submission'), limit) as { target: string; status: string; failure_reason: string | null; result: string | null; from_local_path: string | null; created_at: number; finished_at: number | null; expires_at: number | null }[];
+    return rows.map((r) => {
+      const role: AttachRole = r.target.endsWith('#submission') ? 'submission' : 'brief';
+      const names = sentNames(r.from_local_path).map((name) => ({ name }));
+      const base = { role, started_at: r.created_at, finished_at: r.finished_at };
+      if (r.status === 'done') {
+        let got: ReceivedFile[] | undefined;
+        try { got = (JSON.parse(r.result ?? '{}') as { received?: ReceivedFile[] }).received; } catch { got = undefined; }
+        return { ...base, state: 'received' as const, files: Array.isArray(got) ? got.map((f) => ({ name: String(f.name), size: Number(f.size), sha256: String(f.sha256) })) : names };
+      }
+      const live = r.status === 'offered' || r.status === 'open';
+      if (live && !(r.expires_at !== null && r.expires_at < now)) return { ...base, state: 'uploading' as const, files: names };
+      return { ...base, state: 'failed' as const, files: names, reason: uploadReason(live ? 'idle' : r.status === 'expired' ? 'idle' : r.failure_reason) };
     });
   }
   /** The call that starts a task upload: who, which task and set, the channel and how many paths (never the paths). */

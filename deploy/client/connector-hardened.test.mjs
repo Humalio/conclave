@@ -17,12 +17,13 @@ import { putHub, putAgentKey, readKeyFile, keyFilePath, caFingerprint, markDisco
 import { readIsolation, vaultPlace, markerPath } from './connector/isolation.mjs';
 import { masterPath } from './connector/keystore.mjs';
 import { askVault } from './connector/vaultclient.mjs';
-import { startVault, publicView } from './connector/vault.mjs';
+import { startVault, publicView, PICKUP_REFS_MAX } from './connector/vault.mjs';
 import { installVault, uninstallVault, vaultSpec, g6aProbe, serviceHome, handBack, HOST_SOURCE } from './connector/vaultservice.mjs';
 import { connect, request, openStream } from './connector/hubclient.mjs';
 import { startBroker, askBroker } from './connector/broker.mjs';
 import { registerFolder } from './connector/register.mjs';
-import { approveFolderByConnector } from './connector/approvals.mjs';
+import { approveFolderByConnector, pendingList, approvePickup } from './connector/approvals.mjs';
+import { runHandovers } from './connector/handover.mjs';
 import { canonicalFolder, WIN } from './connector/paths.mjs';
 import { scanTranscript } from './connector/leak.mjs';
 
@@ -38,7 +39,7 @@ const pki = testCa('Hardened CA');
 
 /** A stub hub: issues, renews and revokes turn tokens for the app key and session keys it knows, streams, and logs every request it saw. */
 function stubHub() {
-  const h = { seen: [], issued: new Set(), valid: new Set([SES, SES2]), n: 0 };
+  const h = { seen: [], issued: new Set(), valid: new Set([SES, SES2]), n: 0, handovers: [], pickups: [], confirms: [] };
   h.server = https.createServer({ key: pki.leafKey, cert: pki.leafPem }, (req, res) => {
     let raw = '';
     req.on('data', (c) => { raw += c; });
@@ -47,8 +48,23 @@ function stubHub() {
       let body = null; try { body = raw ? JSON.parse(raw) : null; } catch { /* not json */ }
       h.seen.push({ url: req.url, auth: req.headers.authorization, body });
       if (req.url === '/connector/v1/stream') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write('event: orders\ndata: 1\n\n'); return setTimeout(() => res.end(), 50); }
+      // A key handover (docs/onboarding.md): list, pickup with the new secret, confirm.
+      if (req.url === '/onboard/pickup' || req.url === '/onboard/pickup/confirm') {
+        if (req.headers.authorization !== `Bearer ${APP}`) return json(401, { error: 'unauthorized' });
+        if (req.url === '/onboard/pickup') {
+          const x = h.handovers.find((y) => y.id === body?.request_id && !y.done);
+          if (!x) return json(404, { error: 'not_found' });
+          h.pickups.push(x.id); x.pickup = `pku_${++h.n}`;
+          return json(200, { pickup_id: x.pickup, kind: x.kind, team: null, agents: x.agents.map((a) => ({ ...a, secret: x.secret })) });
+        }
+        const x = h.handovers.find((y) => y.pickup === body?.pickup_id);
+        if (!x) return json(409, { error: 'invalid_state' });
+        h.confirms.push({ id: x.id, written: body.written }); x.done = true;
+        return json(200, { request_id: x.id, state: 'collected' });
+      }
       if (!req.url.startsWith('/connector/v1/')) return json(404, { error: 'not_found' });
       if (req.headers.authorization !== `Bearer ${APP}`) return json(401, { error: 'unauthorized' });
+      if (req.url === '/connector/v1/handovers') return json(200, { handovers: h.handovers.filter((x) => !x.done).map(({ secret, pickup, done, ...x }) => x) });
       if (req.url === '/connector/v1/turn-tokens') {
         if (!h.valid.has(body?.session_key)) return json(401, { error: 'unauthorized' });
         const t = `tok-${++h.n}`; h.issued.add(t); return json(200, { token: t, agent_id: 'agent-1', label: 'Agent', expires_at: Date.now() + 900_000 });
@@ -129,6 +145,14 @@ describe('G6(a): can a process of the PC user read an agent key?', () => {
           answers.push(JSON.stringify(x));
         }
         assert.equal(holds(answers.join('\n'), APP, SES, SES2), false, 'no answer of the service carries a key');
+        // A relayed call outside /connector/v1, /bridge and /mcp (or one climbing out with "..") is refused by the service: the hub never sees it.
+        hub.seen.length = 0;
+        for (const path of ['/api/secret', '/admin/keys', '/connector/v1/../api/secret', '/connector/v1x/turn-tokens', '/mcpx']) {
+          const x = await request(hubC, 'POST', path, { body: { session_key: k.agents['dev-1'].session_key }, headers: { Authorization: `Bearer ${k.app_key}` } }).catch((e) => ({ err: e.reason }));
+          assert.ok(x.status === 403 || x.status === 404 || x.err, `refused: ${path} (${JSON.stringify(x).slice(0, 80)})`);
+          assert.notEqual(x.status, 200, path);
+        }
+        assert.deepEqual(hub.seen.map((q) => q.url), [], 'none of those reached the hub');
         // The service may not be made to put a key anywhere else: only the Authorization header and a session_key value are substituted.
         hub.seen.length = 0;
         const echo = await request(hubC, 'POST', '/connector/v1/echo', { body: { note: 'vault:app', also: k.agents['dev-1'].session_key, nested: { session_key: 'vault:agent:nope:00000000' } }, headers: { Authorization: `Bearer ${k.app_key}`, 'x-note': 'Bearer vault:app' } });
@@ -239,6 +263,82 @@ describe('turn tokens through the service', () => {
       putHub(p.home, { hubId: 'hub-h', origin: hub.origin, caPem: pki.caPem, appKey: APP });
       assert.equal(readKeyFile(p.home).data.hubs[p.hubKey].disconnected_at, undefined, 'pairing again clears it');
     } finally { child?.kill(); await new Promise((r) => setTimeout(r, 100)); await hub.close(); }
+  });
+});
+
+describe('a key handover on a hardened PC', () => {
+  test('still waits for the PC user\'s click, and the new key goes in through the key service, never where the user can read it', async () => {
+    const hub = await stubHub();
+    let child = null;
+    try {
+      const p = pc(hub);
+      const { o } = opts(p, { pings: 100, waitMs: 100,
+        start: async () => { child = spawn(process.execPath, [CLI, 'vault', 'run', '--vault', p.place.dir, '--view', p.place.view, '--address', p.place.address], { stdio: 'ignore' }); } });
+      assert.equal((await installVault(p.home, o)).ok, true);
+      assert.equal(readIsolation(p.home).level, 'hardened');
+      // An agent whose key the hub rotates: its key is in the service (put after Hardened went on).
+      putAgentKey(p.home, p.hubKey, 'dev-3', 'ah_ses_hardoldkey01_FAKEsecretOLDKEY');
+      const before = readKeyFile(p.home).data.hubs[p.hubKey].agents['dev-3'].session_key;
+      assert.match(before, /^vault:agent:dev-3:/);
+      hub.handovers = [{ id: 'obr_hard', kind: 'rotate', description: 'New key for dev-3 (rotation)', expires_at: Date.now() + 86_400_000, secret: 'ah_ses_hardnewkey01_FAKEsecretNEWKEY',
+        agents: [{ agent_id: 'agent-3', label: 'dev-3', role: 'developer', team_role: 'worker', session_var: 'CONCLAVE_DEV3_SESSION_KEY', folder: 'dev-3', key_id: 'hardoldkey01', instructions: '' }] }];
+      const run = () => runHandovers(p.home, p.hubKey, { claudeJson: join(p.base, 'claude.json'), gitBin: null, node: process.execPath, connector: join(p.home, 'conclave.mjs'), root: p.base });
+      // Hardened changes nothing about consent: no pickup until the PC user allows it on the connector's screen.
+      assert.deepEqual((await run()).handovers.map((x) => [x.phase, x.pickup_click]), [['waiting', true]]);
+      assert.deepEqual(hub.pickups, []);
+      const waiting = pendingList(p.home).pickups;
+      assert.deepEqual(waiting.map((x) => x.what), ['New key for dev-3 (rotation)']);
+      approvePickup(p.home, waiting[0].key);
+      const r = await run();
+      assert.equal(r.handovers[0].phase, 'confirmed', JSON.stringify(r));
+      assert.deepEqual(hub.pickups, ['obr_hard']);
+      assert.deepEqual(hub.confirms, [{ id: 'obr_hard', written: ['CONCLAVE_DEV3_SESSION_KEY'] }]);
+      assert.equal(hub.seen.filter((s) => s.url.startsWith('/onboard/pickup')).every((s) => s.auth === `Bearer ${APP}`), true, 'the service sent the real app key');
+      // The new key went to the service: the view shows a new placeholder for the same label, and the secret is nowhere the user can read.
+      const after2 = readKeyFile(p.home).data.hubs[p.hubKey].agents['dev-3'].session_key;
+      assert.match(after2, /^vault:agent:dev-3:/);
+      assert.notEqual(after2, before, 'swapped in');
+      assert.equal(labelHoldingKey(p.home, p.hubKey, 'hardnewkey01'), 'dev-3');
+      assert.equal(holds(reachable(p), 'FAKEsecretNEWKEY', 'FAKEsecretOLDKEY'), false);
+      assert.equal(existsSync(keyFilePath(p.home)), false, 'no user key file came back');
+    } finally { child?.kill(); await new Promise((r) => setTimeout(r, 100)); await hub.close(); }
+  });
+  test('the relayed pickup answer holds references, never a key; a reference is taken once, for its own hub only', async () => {
+    const hub = await stubHub();
+    try {
+      const p = pc(hub);
+      const { o, h } = opts(p);
+      assert.equal((await installVault(p.home, o)).ok, true);
+      try {
+        hub.handovers = [{ id: 'obr_ref', kind: 'rotate', description: 'x', expires_at: Date.now() + 86_400_000, secret: 'ah_ses_refnewkey001_FAKEsecretREFKEY',
+          agents: [{ agent_id: 'agent-1', label: 'dev-1', session_var: 'CONCLAVE_DEV1_SESSION_KEY', folder: 'dev-1', key_id: null }] }];
+        const k = readKeyFile(p.home).data.hubs[p.hubKey];
+        const r = await request(connect(k).hub, 'POST', '/onboard/pickup', { body: { request_id: 'obr_ref' }, headers: { Authorization: `Bearer ${k.app_key}` } });
+        assert.equal(r.status, 200);
+        const text = JSON.stringify(r.json);
+        assert.doesNotMatch(text, /FAKEsecretREFKEY|ah_ses_/);
+        const ref = r.json.agents[0].secret;
+        assert.match(ref, /^vault:pickup:[0-9a-f]{32}$/);
+        // Another hub cannot take it, nor a made-up reference; the right hub takes it once.
+        assert.deepEqual(await askVault(p.place.address, 'stage_agent', { hubKey: 'other-hub', handoverId: 'obr_ref', label: 'dev-1', sessionKey: ref }), { ok: false, reason: 'pickup_expired' });
+        assert.equal((await askVault(p.place.address, 'stage_agent', { hubKey: p.hubKey, handoverId: 'obr_ref', label: 'dev-1', sessionKey: `vault:pickup:${'0'.repeat(32)}` })).ok, false);
+        assert.deepEqual(await askVault(p.place.address, 'stage_agent', { hubKey: p.hubKey, handoverId: 'obr_ref', label: 'dev-1', sessionKey: ref }), { ok: true });
+        assert.equal((await askVault(p.place.address, 'put_agent', { hubKey: p.hubKey, label: 'dev-9', sessionKey: ref })).ok, false, 'spent');
+        assert.equal((await askVault(p.place.address, 'commit_staged', { hubKey: p.hubKey, handoverId: 'obr_ref' })).committed, 1);
+        assert.equal((await askVault(p.place.address, 'label_for_key', { hubKey: p.hubKey, keyId: 'refnewkey001' })).label, 'dev-1');
+        assert.equal(holds(reachable(p), 'FAKEsecretREFKEY'), false);
+        // The references are capped: past PICKUP_REFS_MAX the oldest is dropped, and a dropped one is refused.
+        const many = Array.from({ length: PICKUP_REFS_MAX + 1 }, (_, i) => ({ agent_id: `agent-m${i}`, label: `m-${i}`, session_var: `CONCLAVE_M${i}_SESSION_KEY`, folder: `m-${i}`, key_id: null }));
+        hub.handovers.push({ id: 'obr_many', kind: 'add_agents', description: 'x', expires_at: Date.now() + 86_400_000, secret: 'ah_ses_manynewkey01_FAKEsecretMANY', agents: many });
+        const m = await request(connect(k).hub, 'POST', '/onboard/pickup', { body: { request_id: 'obr_many' }, headers: { Authorization: `Bearer ${k.app_key}` } });
+        assert.equal(m.json.agents.length, PICKUP_REFS_MAX + 1);
+        assert.deepEqual(await askVault(p.place.address, 'stage_agent', { hubKey: p.hubKey, handoverId: 'obr_many', label: 'm-0', sessionKey: m.json.agents[0].secret }), { ok: false, reason: 'pickup_expired' }, 'the oldest was dropped');
+        assert.deepEqual(await askVault(p.place.address, 'stage_agent', { hubKey: p.hubKey, handoverId: 'obr_many', label: 'm-1', sessionKey: m.json.agents[1].secret }), { ok: true });
+        // A refusal passes through as the hub said it (it holds no key).
+        const no = await request(connect(k).hub, 'POST', '/onboard/pickup', { body: { request_id: 'obr_none' }, headers: { Authorization: `Bearer ${k.app_key}` } }).catch((e) => ({ status: e.status }));
+        assert.equal(no.status, 404);
+      } finally { await h.vault?.close(); }
+    } finally { await hub.close(); }
   });
 });
 

@@ -107,7 +107,7 @@ const collect = async (key: string, requestId: string) => {
 };
 const appCred = (secret: string): Credential => app.keys.verifyKey(secret, 'app_key');
 const credOf = (secret: string) => app.db.prepare('SELECT id FROM credentials WHERE key_id=?').get(/^ah_ses_([a-z2-7]{12})_/.exec(secret)![1]!) as { id: string };
-const codeIn = (text: string) => /cnv_enrol_[a-z2-7]{26}/.exec(text)?.[0] ?? null;
+const codeIn = (text: string) => /cnc-pair-[a-z2-7]{26}/.exec(text)?.[0] ?? null;
 const code = (fn: () => unknown): string => { try { fn(); } catch (e) { return (e as { code: string }).code ?? String(e); } return 'ok'; };
 const auditOf = (action: string, id?: string) => app.db.prepare(`SELECT * FROM audit_events WHERE action=?${id ? ' AND target_id=?' : ''}`).all(...(id ? [action, id] : [action])) as { details: string }[];
 const who = (agentId: string, teamId: string): Who => {

@@ -93,9 +93,9 @@ https://{$RELAY_HOST}:{$HTTPS_PORT} {
 	}
 }
 
-# Plain HTTP carries only the hash-checked onboarding downloads a new PC fetches before it trusts the
-# relay's CA (setup.mjs and the header helper against the SHA-256 in the prompt, ca.crt against the
-# fingerprint in the prompt). No machine traffic: MCP, the connector and transfers are HTTPS only here.
+# Plain HTTP carries only the relay's CA certificate, which a new PC may fetch before it trusts that CA
+# and checks against the fingerprint in the prompt. No machine traffic: MCP, the connector and
+# transfers are HTTPS only here.
 http://:{$HTTP_PORT} {
 	log {
 		output stdout
@@ -113,20 +113,6 @@ http://:{$HTTP_PORT} {
 		rewrite * /root.crt
 		header Content-Type application/x-x509-ca-cert
 		file_server
-	}
-	handle /onboard/client/* {
-		reverse_proxy https://{$HUB_UPSTREAM} {
-			header_up Host {$HUB_NAME}
-			header_up -X-Conclave-Relay-Client
-			header_up -X-Conclave-Relay-Secret
-			header_up -X-Forwarded-For
-			header_up -X-Forwarded-Host
-			header_up -X-Forwarded-Proto
-			transport http {
-				tls_server_name {$HUB_NAME}
-				dial_timeout 10s
-			}
-		}
 	}
 	# The hub has no OAuth; answer an MCP client's fallback with 404 so the real 401 stays visible.
 	@oauth path /authorize /authorize/* /register /token /revoke

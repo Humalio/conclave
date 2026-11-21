@@ -1,5 +1,5 @@
 /** Data channel tools (design/08 "Data channels") and file_download. Off by default: a key needs channel.use. */
-import { NOT_ALLOWED } from '../policy/engine.js';
+import { NOT_ALLOWED, missingGrant } from '../policy/engine.js';
 import { promises as fs } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
@@ -109,9 +109,18 @@ export function registerChannelTools(reg: Reg, d: ChannelToolDeps): void {
     return { text: `${n} chunk(s), status ${String(r.status)}${r.final ? `, final, sha256 ${String(r.sha256)}` : ''}${r.failure_reason ? `, ${String(r.failure_reason)}` : ''}${typeof r.close_reason === 'string' ? `. ${l2Block([r.close_reason])}` : ''}`, data: { trust: 'L2', from: 'channel', ...r } };
   });
 
-  reg('channel_status', 'Status of a channel: offered / open / done / expired / closed / failed (+ reason), bytes moved, and for bridge mode the saved path and hash.', { channel_id: id }, true, async (ctx, a) => {
-    use(ctx);
-    const c = channels.mine(a.channel_id, ctx.session.agent.id);
+  reg('channel_status', 'Status of a channel: offered / open / done / expired / closed / failed (+ reason), bytes moved, and for bridge mode the saved path and hash. Your own task-file uploads (local_path on task_create, task_update, task_submit) need no channel grant.', { channel_id: id }, true, async (ctx, a) => {
+    const s = ctx.session;
+    channels.sweep();
+    const own = channels.get(a.channel_id);
+    // The caller's own task-file upload: it was opened by its task call, which needs no channel grant, so neither does its status.
+    if (!(own && own.opened_with === 'task_attach' && own.from_agent_id === s.agent.id)) {
+      // Any other channel: the tool grant (channel_status is a default tool only for the case above) and channel.use, as before.
+      const dec = authorize(s.rules, s.cap, 'tool.invoke', 'tool:channel_status');
+      if (!dec.allowed) throw new ToolError('denied', missingGrant('tool.invoke', 'tool:channel_status'), { missing_grant: { action: 'tool.invoke', resource: 'tool:channel_status' } });
+      use(ctx);
+    }
+    const c = channels.mine(a.channel_id, s.agent.id);
     return { text: sumText(c), data: { ...channels.view(c) } };
   });
 

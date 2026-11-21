@@ -4,7 +4,7 @@
  *
  * - **One session per task.** A new task's first item starts a fresh `claude -p` (or `codex exec`) in the agent's folder: the role
  *   file, a fixed prompt and ids, nothing else. Later items on the same task resume that session. When the task ends the session
- *   is forgotten and never resumed. An item with no task gets a fresh short run.
+ *   is forgotten and never resumed. An item with no task resumes the agent's one inbox session (under 12 h, same client, no chat open), else starts fresh and remembers it.
  * - **One turn at a time per agent folder.** An item for the running task (or with no task) reaches the turn as the hub's own
  *   inline notice, so it is answered at once. An item for another task waits here, its order open, and starts when the turn ends.
  * - **No keys.** The run is started by the connector's launcher (the folder is marked as a launcher run, so it needs no click), and
@@ -33,6 +33,7 @@ import { sendResult } from './outbox.mjs';
 import { setWakeOwnsSession, resetIfIdle } from './reset.mjs';
 import { ORDER_REASONS } from './orders.mjs';
 
+export const INBOX_MAX_MS = 12 * 3600_000;    // an inbox session older than this is not resumed
 export const WAKE_CAP_MS = 10 * 60_000;      // agent messages: one wake per agent per 10 minutes
 export const NO_ACTIVITY_MS = 30 * 60_000;    // the console says "No activity for 30 min" after this; nothing stops
 export const RESUME_SPREAD_MS = 4 * 60_000;   // resumes after a usage limit are spread over this long
@@ -79,14 +80,23 @@ export function setAgentMessages(home, on) { const s = wakeSettings(home); s.age
 export const wakeEnabled = (home, label) => wakeSettings(home).agents[label] === true;
 
 /** The words of a notice, fixed (never text from the hub). */
-const WORDS = { task_assigned: 'a task was assigned to you', changes_requested: 'changes were requested on your task', review_requested: 'a review was requested', decision: 'a decision was answered', task_accepted: 'a backlog task was accepted', team_resumed: 'your team was resumed', message: 'a message arrived', plan_request: 'the administrator asked for a plan or refinement', task_approved: 'a task was approved', task_blocked: 'a task was blocked', decision_asked: 'an operator question was asked' };
+const WORDS = { task_assigned: 'a task was assigned to you', changes_requested: 'changes were requested on your task', review_requested: 'a review was requested', decision: 'a decision was answered', task_accepted: 'a backlog task was accepted', retry: 'a task you worked on still waits on you', limit: 'your earlier turn was cut short by a usage limit', team_resumed: 'your team was resumed', message: 'a message arrived', plan_request: 'the administrator asked for a plan or refinement', task_approved: 'a task was approved', task_blocked: 'a task was blocked', decision_asked: 'an operator question was asked' };
 /** The prompt of a reason order (docs/connector.md, "Reason orders"): fixed words per reason, never text from the hub. */
 const REASON_PROMPTS = {
   team_start: 'Conclave woke you for a check-in: your team was started from the console. Call directives_read {unread: true, ack: true} and task_list, start nothing new unless a task assigned to you says so, then end your turn.',
   write_handout: 'Conclave woke you: your team is being moved to another PC. Call checkout_status and follow its steps, write your handout with checkout_handout, then end your turn.',
   resume: 'Conclave woke you: your team was moved to this PC. Call checkout_resume first, then task_list, and carry on with what waits on you.',
 };
-export const promptFor = (items, task, reason) => REASON_PROMPTS[reason] ?? `Conclave woke you: ${[...new Set(items.map((i) => WORDS[i.notice] ?? 'work waits'))].join('; ')}${task ? ` (task ${task})` : ''}. Call task_list${task ? ` {task_id: "${task}"}` : ''} and message_read for the details, do what waits on you, then end your turn.`;
+const TASK_NOTICES = new Set(['task_assigned', 'changes_requested', 'review_requested', 'task_accepted', 'task_approved', 'task_blocked', 'retry']);
+/** What the prompt says to read: only what waits (a task item its task, a message the messages, a decision the decision log), never a read nothing waits on. */
+const readsFor = (items, task) => {
+  const kinds = new Set(items.map((i) => i.notice)), reads = [];
+  if (task || [...kinds].some((k) => TASK_NOTICES.has(k))) reads.push(task ? `task_list {task_id: "${task}"}` : 'task_list');
+  if (kinds.has('message')) reads.push('message_read');
+  if (kinds.has('decision') || kinds.has('decision_asked')) reads.push('team_decisions');
+  return reads.length ? reads : ['task_list', 'message_read']; // a notice with no read of its own (a plan request, a usage-limit re-run): both, as before
+};
+export const promptFor = (items, task, reason) => REASON_PROMPTS[reason] ?? `Conclave woke you: ${[...new Set(items.map((i) => WORDS[i.notice] ?? 'work waits'))].join('; ')}${task ? ` (task ${task})` : ''}. Call ${readsFor(items, task).join(' and ')} for the details, do what waits on you, confirm the notices you handled with session_ack (the highest notice_seq you saw), then end your turn.`;
 
 /** The fixed lines the connector sends the hub about a run (never text from the run). */
 export const STATES = ['running', 'waiting', 'paused_usage', 'needs_approval', 'ended', 'stopped'];
@@ -95,10 +105,33 @@ export const STATES = ['running', 'waiting', 'paused_usage', 'needs_approval', '
 const clock = (ms) => new Date(ms).toTimeString().slice(0, 5);
 
 /**
- * Reads a run's output file (JSON lines) for the numbers and structured facts that matter: the session id, whether the turn
- * produced a result, tool approvals it was refused, and a usage limit with its reset time. Text of messages is never read.
+ * Codex reports its plan limit as an error of the run (an `error` event, or `turn.failed` with an `error`), never as agent text.
+ * The reset time is its own structured field (`resets_at`, seconds since 1970, or `resets_in_seconds`) or the "try again in
+ * 3 hours 20 minutes" of the error; with none the pause is an hour. `null` when the event is not a usage limit.
  */
-export function readRun(file) {
+const CODEX_LIMIT = /usage limit|hit your (?:\w+ )?limit|reached your (?:\w+ )?limit|rate limit(?:ed)? reached/i;
+const DEFAULT_PAUSE_MS = 60 * 60_000;
+/** No plan resets later than this; a reset given in the wrong unit (milliseconds read as seconds) must not pause a profile for years. */
+export const MAX_PAUSE_MS = 8 * 24 * 3600_000;
+export function codexLimitAt(e, nowMs) {
+  const err = e.type === 'error' ? e : e.type === 'turn.failed' ? e.error : null;
+  if (!err || typeof err !== 'object') return null;
+  const message = typeof err.message === 'string' ? err.message : '';
+  if (!CODEX_LIMIT.test(message) && !/usage_limit/i.test(String(err.code ?? err.type ?? ''))) return null;
+  const info = err.rate_limits ?? err.rate_limit ?? err;
+  const at = Number(info.resets_at), inSeconds = Number(info.resets_in_seconds ?? info.resets_in);
+  if (Number.isFinite(at) && at > 0) return Math.max(at * 1000, nowMs);
+  if (Number.isFinite(inSeconds) && inSeconds > 0) return nowMs + inSeconds * 1000;
+  const m = /try again in\s+(?:(\d+)\s*(?:days?|d)\s*)?(?:(\d+)\s*(?:hours?|hrs?|h)\s*)?(?:(\d+)\s*(?:minutes?|mins?|m)\s*)?(?:(\d+)\s*(?:seconds?|secs?|s)\b)?/i.exec(message);
+  const ms = m ? ((+m[1] || 0) * 86400 + (+m[2] || 0) * 3600 + (+m[3] || 0) * 60 + (+m[4] || 0)) * 1000 : 0;
+  return nowMs + (ms > 0 ? ms : DEFAULT_PAUSE_MS);
+}
+
+/**
+ * Reads a run's output file (JSON lines) for the numbers and structured facts that matter: the session id, whether the turn
+ * produced a result, tool approvals it was refused, and a usage limit with its reset time (never later than 8 days from now). Text of messages is never read.
+ */
+export function readRun(file, nowMs = Date.now()) {
   let text = '';
   try { text = readFileSync(file, 'utf8'); } catch { return { session: null, result: false, error: false, denials: 0, limit: null, last: null }; }
   const out = { session: null, result: false, error: false, denials: 0, limit: null, last: null };
@@ -109,8 +142,10 @@ export function readRun(file) {
     if (e.type === 'thread.started' && typeof e.thread_id === 'string') out.session = e.thread_id;
     if (e.type === 'result') { out.result = true; out.error = e.is_error === true; if (Array.isArray(e.permission_denials)) out.denials = e.permission_denials.length; }
     if (e.type === 'turn.completed') out.result = true;
+    const cl = codexLimitAt(e, nowMs); if (cl) out.limit = cl;
     if (e.type === 'rate_limit_event' && e.rate_limit_info && e.rate_limit_info.status === 'rejected' && Number.isFinite(e.rate_limit_info.resetsAt)) out.limit = e.rate_limit_info.resetsAt * 1000;
   }
+  if (out.limit) out.limit = Math.min(out.limit, nowMs + MAX_PAUSE_MS);
   return out;
 }
 
@@ -119,6 +154,7 @@ export function readRun(file) {
  * `startTime`, `now`, `bin(provider)`, `isAlive`, `kill`, `args(provider, {prompt, session, resume})`.
  */
 export function createWake({ home, log = () => {}, broker = null, deps = {} }) {
+  let runSeq = 0;
   const now = deps.now ?? Date.now;
   const spawnFn = deps.spawn ?? spawnDefault;
   const req = deps.request ?? request;
@@ -181,10 +217,12 @@ export function createWake({ home, log = () => {}, broker = null, deps = {} }) {
     const folder = bind && canonicalFolder(bind.path);
     if (!folder) return false;
     const provider = bind.provider === 'codex' ? 'codex' : 'claude';
-    const known = work.task ? a.sessions[work.task] : null;
+    // An item with no task resumes the agent's inbox session while it is the same client and young enough; a reason order or a re-run after a failed resume starts fresh.
+    const inboxOk = !work.task && !work.reason && !work.fresh && a.inbox?.id && a.inbox.provider === provider && now() - a.inbox.at < INBOX_MAX_MS;
+    const known = work.task ? a.sessions[work.task] : inboxOk ? a.inbox : null;
     const resume = !!known, session = known?.id ?? (provider === 'codex' ? null : randomUUID());
     mkdirSync(dirOf(home), { recursive: true });
-    const out = join(dirOf(home), `run-${createHash('sha256').update(ctx.hubKey + agentId).digest('hex').slice(0, 12)}-${now()}.jsonl`);
+    const out = join(dirOf(home), `run-${createHash('sha256').update(ctx.hubKey + agentId).digest('hex').slice(0, 12)}-${now()}-${++runSeq}.jsonl`);
     const fd = openSync(out, 'a');
     let child;
     const prog = program(provider, folder);
@@ -210,7 +248,7 @@ export function createWake({ home, log = () => {}, broker = null, deps = {} }) {
     child.on?.('exit', (code) => { children.set(`${ctx.hubKey}|${agentId}`, { pid: child.pid, code: code ?? 0 }); finishSoon(ctx.hubKey, agentId, child.pid); });
     child.unref?.();
     try { if (child.pid) recordStarted(home, { pid: child.pid, image: prog.file, ...(prog.prefix[0] ? { script: prog.prefix[0] } : {}), hubKey: ctx.hubKey, what: `woken turn for ${a.label}` }); } catch { /* not recorded: it is then never ended by Disconnect */ }
-    a.run = { pid: child.pid, started: startTime(child.pid) ?? now(), began: now(), out, task: work.task ?? null, session, provider, tries: work.tries ?? 0, items: work.items.length, profile: profileOf(home, folder), folder };
+    a.run = { pid: child.pid, started: startTime(child.pid) ?? now(), began: now(), out, task: work.task ?? null, session, provider, tries: work.tries ?? 0, items: work.items.length, work: work.items.slice(0, 20), inbox: work.task || work.reason ? null : (resume ? 'resumed' : 'fresh'), profile: profileOf(home, folder), folder };
     save(home, ctx.hubKey, d);
     log(`wake: a turn started for ${a.label}${work.task ? ` on task ${work.task}` : ''} (${resume ? 'resumed' : 'fresh'} ${provider} session)`);
     await report(ctx, agentId, a, 'running');
@@ -227,9 +265,12 @@ export function createWake({ home, log = () => {}, broker = null, deps = {} }) {
   async function finish(ctx, agentId) {
     let d = load(home, ctx.hubKey), a = d.agents[agentId];
     if (!a?.run) return;
-    const run = a.run, seen = readRun(run.out);
+    const run = a.run, seen = readRun(run.out, now());
     const key = run.task ?? null;
     if (seen.session && key) a.sessions[key] = { id: seen.session, at: now(), provider: run.provider };
+    const failedResume = run.inbox === 'resumed' && !seen.result && !seen.limit;
+    const inboxId = seen.session ?? (seen.result ? run.session : null);
+    if (run.inbox && inboxId && !failedResume) a.inbox = { id: inboxId, at: now(), provider: run.provider };
     a.run = null;
     forgetStarted(home, run.pid);
     broker?.launcherRuns.delete(pathKey(run.folder));
@@ -237,7 +278,7 @@ export function createWake({ home, log = () => {}, broker = null, deps = {} }) {
     if (seen.limit) {
       const spread = Math.floor(parseInt(createHash('sha256').update(agentId).digest('hex').slice(0, 6), 16) / 0xffffff * RESUME_SPREAD_MS);
       d.pause[run.profile ?? '-'] = { until: seen.limit + spread };
-      a.queue.unshift({ order: null, task: run.task, items: [{ notice: 'message' }], tries: run.tries });
+      a.queue.unshift({ order: null, task: run.task, items: [{ notice: 'limit' }], tries: run.tries });
       save(home, ctx.hubKey, d);
       log(`wake: ${a.label}: usage limit, resumes at ${clock(seen.limit + spread)}`);
       await report(ctx, agentId, a, 'paused_usage', { resumes_at: seen.limit + spread });
@@ -248,13 +289,15 @@ export function createWake({ home, log = () => {}, broker = null, deps = {} }) {
     if (seen.denials > 0) { save(home, ctx.hubKey, d); log(`wake: ${a.label}: a tool needed approval; the turn ended`); await report(ctx, agentId, a, 'needs_approval'); return; }
     save(home, ctx.hubKey, d); // the run is over on disk before anything is awaited
     // A reset waits for the turn's end (reset.mjs): the next item starts a fresh session.
-    const r = await resetIfIdle(home, ctx.hubKey, agentId, { turnRunning: () => false, closeSession: () => { const x = load(home, ctx.hubKey); if (x.agents[agentId]) { x.agents[agentId].sessions = {}; save(home, ctx.hubKey, x); } } });
+    const r = await resetIfIdle(home, ctx.hubKey, agentId, { turnRunning: () => false, closeSession: () => { const x = load(home, ctx.hubKey); if (x.agents[agentId]) { x.agents[agentId].sessions = {}; delete x.agents[agentId].inbox; save(home, ctx.hubKey, x); } } });
     if (r.state === 'done' && r.order) await sendResult({ home, hubKey: ctx.hubKey, hub: ctx.hub, auth: ctx.auth, request: req, log }, r.order, 'done', null);
     // Completion is the hub's word: does the agent still hold work on this task?
     let check = null;
     try { const c = await req(ctx.hub, 'POST', '/connector/v1/wake/check', { body: { agent_id: agentId, ...(run.task ? { task: run.task } : {}) }, headers: ctx.auth }); if (c.status === 200) check = c.json; } catch { /* unreachable: the next check-in decides */ }
     d = load(home, ctx.hubKey); a = d.agents[agentId]; // read again: a delivery may have saved while the check was out
     if (!a) return;
+    // A resumed inbox session that did not run (the client could not resume it): forget it and run the same items once more, fresh.
+    if (failedResume) { delete a.inbox; a.queue.unshift({ order: null, task: null, items: run.work?.length ? run.work : [{ notice: 'retry' }], tries: run.tries, fresh: true }); log(`wake: ${a.label}: the inbox session could not be resumed; it starts fresh`); }
     if (run.task && check && check.task_open === false) delete a.sessions[run.task]; // the task ended: its session is closed for good
     const unacted = !!check && (run.task ? check.held?.some((h) => h.task === run.task && h.phase === 'queued') : false);
     // Stop team: the hub paused the team, so nothing more starts; the waiting orders say why, and the turn that just ended was the last.
@@ -265,7 +308,7 @@ export function createWake({ home, log = () => {}, broker = null, deps = {} }) {
       await report(ctx, agentId, a, 'ended');
       return;
     }
-    if (unacted && run.tries < MAX_RETRIES && !seen.error) a.queue.unshift({ order: null, task: run.task, items: [{ notice: 'message' }], tries: run.tries + 1 });
+    if (unacted && run.tries < MAX_RETRIES && !seen.error) a.queue.unshift({ order: null, task: run.task, items: [{ notice: 'retry' }], tries: run.tries + 1 });
     else if (unacted) log(`wake: ${a.label}: the turn ended and task ${run.task} still waits on it; the hub's deadline flags it`);
     save(home, ctx.hubKey, d);
     await report(ctx, agentId, a, 'ended');

@@ -41,22 +41,23 @@ import { execDefault, servicePidPath, workerLockPath } from './service.mjs';
 import { atomicWrite, oneLine } from './paths.mjs';
 import { runDisconnect } from './disconnect.mjs';
 import { collectUsage, sendUsage, usageOptIn } from './usage.mjs';
-import { runLoop as runBridge, foreignFoldersOf } from './transfers.mjs';
+import { runLoop as runBridge, foreignFoldersOf, ownFoldersOf } from './transfers.mjs';
 import { createSyncHost } from './syncrunner.mjs';
 import { sampler, queueSample, hardwareOptIn, SAMPLE_MS, SAMPLE_MAX } from './hardware.mjs';
 import { reportDestinations } from './destinations.mjs';
 import { contextReport } from './contextsize.mjs';
 import { agentIdOf } from './run.mjs';
-import { legacyLeftovers } from './migrate.mjs';
+import { legacyLeftoverKinds } from './migrate.mjs';
 
-/** The leftovers flag for the check-in, read at most once a minute (on Windows it reads the registry through a child process). */
-let leftoversMemo = { at: 0, home: null, value: false };
-export function legacyLeftoversCached(home, now = Date.now(), read = legacyLeftovers) {
-  if (leftoversMemo.home !== home || now - leftoversMemo.at >= 60_000) leftoversMemo = { at: now, home, value: !!read(home) };
+/** The leftover kinds for the check-in, read at most once a minute (on Windows it reads the registry through a child process). */
+let leftoversMemo = { at: 0, home: null, value: [] };
+export function legacyLeftoverKindsCached(home, now = Date.now(), read = legacyLeftoverKinds) {
+  if (leftoversMemo.home !== home || now - leftoversMemo.at >= 60_000) leftoversMemo = { at: now, home, value: read(home) };
   return leftoversMemo.value;
 }
 import { beginRestore, runRestore, activeRestores, finishRestore, save as saveRestore } from './restore.mjs';
 import { runHandovers } from './handover.mjs';
+import { advance as advanceSetup, loadSetup } from './onboard.mjs';
 
 export const CHECK_IN_MS = 60_000;
 export const UPDATE_CHECK_MS = 6 * 3600_000;
@@ -97,7 +98,7 @@ export function report(home, hubKey, pc, section = null, contextCache = null) {
   const s = readSettings(home);
   // The isolation level (docs/connector.md): standard here; the hardened service reports its own.
   const context = contextCache ? contextReport(home, hubKey, section, contextCache, { labelToId: (l) => agentIdOf(home, hubKey, l) }) : undefined;
-  return { version: CONNECTOR_VERSION, platform: platformId(), node: pc.node, git: pc.git, clients: pc.clients, ...s, isolation: isHardened(home) ? 'hardened' : 'standard', key_store: isHardened(home) ? 'service' : storeName(home), agents: runningAgents(home, hubKey), destinations: reportDestinations(home), legacy_leftovers: legacyLeftoversCached(home), ...(context ? { context } : {}) };
+  return { version: CONNECTOR_VERSION, platform: platformId(), node: pc.node, git: pc.git, clients: pc.clients, ...s, isolation: isHardened(home) ? 'hardened' : 'standard', key_store: isHardened(home) ? 'service' : storeName(home), agents: runningAgents(home, hubKey), destinations: reportDestinations(home), ...(() => { const k = legacyLeftoverKindsCached(home); return { legacy_leftovers: k.length > 0, legacy_leftover_kinds: k }; })(), ...(context ? { context } : {}) };
 }
 
 /** The rows a `check` order reports: one per agent folder of that hub, then the connector's own. At most 40. */
@@ -275,6 +276,29 @@ export async function runWorker({ home, signal, log = logTo(home), claudeJson, d
   }
 
   /**
+   * The team request this PC filed (docs/onboarding.md, "The installer, in one step"): one step of setup each check-in, so an approved request is
+   * picked up, built and confirmed with no one at the screen and no command to run. Nothing happens while there is no request, or one that is finished or closed.
+   * A phase is logged once when it changes.
+   */
+  const setupPhase = new Map();
+  // A step that failed (an error, or agents whose folders did not build) is tried again after a wait that doubles from one minute to half an hour, so a request that cannot finish does not retry at every check-in. Any other answer starts the wait over.
+  const setupRetry = new Map();
+  const SETUP_BACKOFF_BASE = deps.setupBackoffMs ?? 60_000, SETUP_BACKOFF_MAX = deps.setupBackoffMaxMs ?? 1_800_000;
+  const setupFailed = (hubKey) => { const o = setupRetry.get(hubKey) ?? { n: 0 }; o.n += 1; o.at = Date.now() + Math.min(SETUP_BACKOFF_MAX, SETUP_BACKOFF_BASE * 2 ** (o.n - 1)); setupRetry.set(hubKey, o); };
+  async function setupStep(hubKey, section) {
+    if ((setupRetry.get(hubKey)?.at ?? 0) > Date.now()) return;
+    let st;
+    try { st = loadSetup(home, section.hub_id); } catch { return; }
+    if (!st?.request || st.confirmed || ['denied', 'withdrawn', 'cancelled', 'collected'].includes(st.request.state)) return;
+    try {
+      const r = await (deps.advanceSetup ?? advanceSetup)(home, hubKey, { waitS: 0, claudeJson, node: deps.node, connector: deps.connector, gitBin: deps.gitBin });
+      if (r.phase === 'set_up' && r.failed?.length) setupFailed(hubKey); else setupRetry.delete(hubKey);
+      const line = r.phase === 'set_up' ? `set up (${r.built.length} built${r.failed.length ? `, ${r.failed.length} failed` : ''})` : r.phase === 'waiting' ? `waiting (${r.stage ?? 'admin'})` : r.phase;
+      if (setupPhase.get(hubKey) !== line) { setupPhase.set(hubKey, line); log(`hub ${section.hub_id}: team request ${line}`); }
+    } catch (e) { setupFailed(hubKey); const line = `not carried out (${e.reason ?? e.message})`; if (setupPhase.get(hubKey) !== line) { setupPhase.set(hubKey, line); log(`hub ${section.hub_id}: team request ${line}`); } }
+  }
+
+  /**
    * Key handovers waiting for this PC (docs/onboarding.md#key-handover-a-rotated-key-or-a-recruit-reaches-a-connector-pc): a rotated key
    * or a recruit's agents, picked up only after the PC's user allowed it on the local screen. One run per hub at a time; a hint while
    * one runs runs it again after.
@@ -368,7 +392,7 @@ export async function runWorker({ home, signal, log = logTo(home), claudeJson, d
    */
   const sentFolders = new Map();
   async function registerFolders(hubKey, section, hub, auth) {
-    const list = foldersOfHub(home, section.hub_id, section.ca_sha256).filter((b) => b.agent && b.path).map((b) => ({ agent: b.agent, path: b.path })).sort((a, b) => (a.path < b.path ? -1 : 1)).slice(0, 200);
+    const list = foldersOfHub(home, section.hub_id, section.ca_sha256).filter((b) => b.agent && b.path).map((b) => ({ agent: b.agent, ...(b.agent_id ? { agent_id: b.agent_id } : {}), path: b.path })).sort((a, b) => (a.path < b.path ? -1 : 1)).slice(0, 200);
     const sig = JSON.stringify(list);
     if (!list.length || sentFolders.get(hubKey) === sig) return;
     try {
@@ -425,7 +449,7 @@ export async function runWorker({ home, signal, log = logTo(home), claudeJson, d
       signal?.addEventListener('abort', () => ac.abort(), { once: true });
       bridges.set(hubKey, ac);
       // A send reads only from the sending agent's own folder on this hub, never the connector's own folder (docs/transfers.md).
-      const agentFolders = (label) => foldersOfHub(home, section.hub_id, section.ca_sha256).filter((b) => b.agent === label).map((b) => b.path);
+      const agentFolders = (who) => ownFoldersOf(foldersOfHub(home, section.hub_id, section.ca_sha256), who, (b) => agentIdOf(home, hubKey, b.agent));
       // A save lands in no other agent's folder: every folder bound on this hub to an agent other than the receiver.
       // The receiver is told apart by its agent id where this PC knows it (the binding's, else the id its relay recorded), by label only where it does not.
       const foreignFolders = (who) => foreignFoldersOf(foldersOfHub(home, section.hub_id, section.ca_sha256), who, (b) => agentIdOf(home, hubKey, b.agent));
@@ -441,6 +465,7 @@ export async function runWorker({ home, signal, log = logTo(home), claudeJson, d
     }
     if (measured.has(hubKey) && hardwareOptIn(home)) await sendSamples(section, hub, auth, measured.get(hubKey));
     if (r.json?.handovers > 0) await handovers(hubKey, section);
+    await setupStep(hubKey, section);
     if (r.json?.orders > 0) await orders(hubKey, section, hub, auth).catch((e) => log(`hub ${section.hub_id}: orders failed (${e.reason ?? e.message})`));
     if (!measured.has(hubKey)) await resumeRestores(hubKey, section, hub, auth).catch((e) => log(`hub ${section.hub_id}: restore failed (${e.reason ?? e.message})`));
     if (!restart && autoUpdateOn(home) && Date.now() - lastUpdateCheck > UPDATE_CHECK_MS) {

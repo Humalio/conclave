@@ -474,7 +474,6 @@ export async function runRestore(cx, s) {
         if (!pickupApproved(home, hubKey, s.request_id) && pickupDenied(home, hubKey, s.request_id)) return { phase: 'waiting', note: 'Declined on this PC. The PC user can still allow it on the connector screen.' };
         if (!pickupApproved(home, hubKey, s.request_id)) { requestPickup(home, hubKey, s.request_id, 'session keys for a restored team', s.agents.map((x) => ({ agent: x.label, path: x.dir }))); return { phase: 'waiting', note: "Waiting for the PC's user to allow the key pickup on the connector's screen." }; }
         const p = await call('POST', '/onboard/pickup', { request_id: s.request_id });
-        spendPickup(home, hubKey, s.request_id);
         s.pickup_id = p.pickup_id; s.instructions = {};
         for (const pa of p.agents) {
           const ag = s.agents.find((x) => x.agent_id === pa.agent_id);
@@ -504,6 +503,8 @@ export async function runRestore(cx, s) {
         throw e;
       }
       s.confirmed = true; s.trust = c.trust ?? {};
+      // The click covers the request until confirm (docs/connector.md "Clicks"): a crash or a replaced pickup does not ask twice.
+      spendPickup(home, hubKey, s.request_id);
       for (const ag of s.agents) invalidate(home, hubKey, ag.label); // checkout_resume accepts only a login made after confirm
       save(home, s);
     }

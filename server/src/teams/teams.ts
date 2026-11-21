@@ -14,7 +14,8 @@ import { isAdmin } from '../audit/audit.js';
 import { scrub } from '../audit/scrub.js';
 import type { Rule, Cap } from '../policy/engine.js';
 import { normTagList } from '../directives/directives.js';
-import { allowsAll, authorize, describeRuleChanges } from '../policy/engine.js';
+import { actionCovers, allowsAll, authorize, describeRuleChanges, resourceCovers } from '../policy/engine.js';
+import { FOLDER_READ } from '../policy/ownerScope.js';
 import { newId } from '../util/ids.js';
 import { randomToken } from '../util/crypto.js';
 import { openRequests, type RequestRow } from '../blueprint/requests.js';
@@ -261,6 +262,8 @@ export class Teams {
    * Set by onboarding (docs/onboarding.md#recruits-from-a-coordinator): files the recruit's pickup on the coordinator's PC,
    * inside the recruit's transaction. The key is created at pickup and written to that PC's keys.env, never returned.
    */
+  /** Set by onboarding: the problems that keep these folders outside an owner's folder grants, as an invite checks them. */
+  ownerFolderProblems?: (owner: string, folders: { path: string; access: 'read' | 'write' }[]) => string[];
   recruitPickup?: (o: { team: TeamRow; agentId: string; label: string; role: string; purpose: string; rules: Omit<Rule, 'id'>[]; days: number; machineId: string | null; by: string }, actor: Actor) => RecruitPickup;
   /** Set by onboarding: recruiting ended for the team, so its recruits' waiting pickups are cancelled. */
   onRecruitsRetired?: (teamId: string, actor: Actor) => number;
@@ -787,7 +790,11 @@ export class Teams {
     });
     this.overrun.delete(id);
     this.audit.event(actor, 'team.resume', { kind: 'team', id }, t.paused_until ? { reason: t.paused_reason, until: t.paused_until } : undefined);
-    this.notifyMembers(id, 'team_resumed', `Team "${t.name}" resumed.`);
+    // A member with live work (a task assigned to it or waiting for its review) is woken; the others see it at their next turn. A coordinator is always woken on a resume, whatever the tasks: it decides what the team does next.
+    const busy = new Set((this.db.prepare("SELECT assignee_agent_id a, reviewer_agent_id r, status FROM tasks WHERE team_id=? AND status IN ('assigned','changes_requested','in_progress','in_review')").all(id) as { a: string | null; r: string | null; status: string }[])
+      .map((x) => (x.status === 'in_review' ? x.r : x.a)).filter((x): x is string => !!x));
+    for (const m of this.members(id)) this.keys.notify(m.agent_id, busy.has(m.agent_id) || m.role === 'coordinator' ?'team_resumed' : 'team_resumed_note', `Team "${t.name}" resumed.`);
+    this.wake();
     return this.team(id)!;
   }
   stop(id: string, actor: Actor): TeamRow {
@@ -1465,7 +1472,7 @@ export class Teams {
       this.db.prepare('UPDATE tasks SET approval_requested=1, updated_at=? WHERE id=?').run(now, t.id);
       this.event(t.id, 'approved', 'approved', actor, 'no_review', 'awaiting administrator approval');
       this.audit.alert('info', 'checkpoint', t.id, { team: team.name, task: t.title, note: 'task completion awaits approval' });
-      this.notifyMembers(team.id, 'task_approved', `Task ${l2(t.title)} (${t.id}) needs no review and waits for the administrator's approval.`, ['coordinator'], { task: t.id, state: 'approved' }, agentId ?? undefined);
+      this.notifyMembers(team.id, 'task_awaiting_approval', `Task ${l2(t.title)} (${t.id}) needs no review and waits for the administrator's approval.`, ['coordinator'], { task: t.id, state: 'approved' }, agentId ?? undefined);
     } else {
       this.finish({ ...t, status: 'approved' }, actor, 'no_review', 'closed without review');
       this.notifyMembers(team.id, 'task_done', `Task ${l2(t.title)} (${t.id}) was submitted, needs no review and is done.`, ['coordinator'], { task: t.id, state: 'done' }, agentId ?? undefined);
@@ -2344,24 +2351,61 @@ export class Teams {
     return members + waiting + pending;
   }
   /**
-   * The permissions a recruit gets, never more than the coordinator holds for good: its standing rules only (team
-   * rules belong to the team, and a temporary grant must not become a recruit's lasting one), within its app key's
-   * cap. With a template: that template, refused unless each allow is provably covered. Without one: a read-only copy
-   * of the coordinator's vault access. Either way the coordinator's and the cap's deny rules on paths come along.
+   * The team's ceiling (docs/onboarding.md#the-teams-ceiling-for-a-recruit-template): each member who was not recruited
+   * into the team, with its own standing rules read now (team rules and temporary grants never count). When the
+   * coordinator has an owner, only that owner's agents: a recruit takes the coordinator's owner, so it never gets folders
+   * that only another owner's agents hold.
    */
-  private recruitRules(t: TeamRow, coordRules: Rule[], coordCap: Rule[]): Omit<Rule, 'id'>[] {
+  private teamCeiling(teamId: string, owner: string | null): { allows: Rule[]; denies: Rule[] }[] {
+    return this.members(teamId).flatMap((m) => {
+      const ag = this.keys.agent(m.agent_id), c = this.keys.credential(m.credential_id);
+      if (!c || ag?.recruited_team_id === teamId || (owner && ag?.owner_user_id !== owner)) return [];
+      const rules = this.keys.rules(c.policy_id, false).filter((r) => r.not_after === undefined);
+      return [{ allows: rules.filter((r) => r.effect === 'allow'), denies: rules.filter((r) => r.effect === 'deny') }];
+    });
+  }
+  /**
+   * The permissions a recruit gets. With a template: that template, checked against the team's ceiling, not the
+   * coordinator's own rules, so a coordinator needs no file access to recruit. Each allow must be held whole by one
+   * member: an allow of that member covers it and none of its denies overlaps it. For an owned coordinator, each folder
+   * must also sit within the owner's folder grants, as an invite's do; and everything within the coordinator's app key's
+   * cap. Refused with the first action beyond, and audited either way. Without a template: a read-only copy of the
+   * coordinator's own standing vault access, as before. Either way the coordinator's and the cap's deny rules on paths
+   * come along.
+   */
+  private recruitRules(t: TeamRow, coordRules: Rule[], coordCap: Rule[], coordinatorId: string): Omit<Rule, 'id'>[] {
     const own = coordRules.filter((r) => !r.team_id && !r.id.startsWith('tmp:') && r.not_after === undefined);
-    const holds = (action: string, resource: string) => allowsAll(own, action, resource) && (coordCap.length === 0 || allowsAll(coordCap, action, resource));
+    const inCap = (action: string, resource: string) => coordCap.length === 0 || allowsAll(coordCap, action, resource);
+    const holds = (action: string, resource: string) => allowsAll(own, action, resource) && inCap(action, resource);
     const denies = [...own, ...coordCap].filter((r) => r.effect === 'deny' && r.resource.startsWith('path:'))
       .map((r) => ({ effect: 'deny' as const, actions: r.actions, resource: r.resource, note: "recruit: the coordinator's own limit" }));
     if (t.recruit_template_id) {
       const tpl = this.keys.rules(t.recruit_template_id).map(({ id: _id, ...r }) => r);
+      const owner = this.keys.agent(coordinatorId)?.owner_user_id ?? null;
+      const ceiling = this.teamCeiling(t.id, owner);
+      const overlaps = (d: Rule, action: string, resource: string) => d.actions.some((x) => actionCovers(x, action) || actionCovers(action, x))
+        && (resourceCovers(d.resource, resource) || resourceCovers(resource, d.resource));
+      const heldWhole = (action: string, resource: string) => ceiling.some((m) => allowsAll(m.allows, action, resource) && !m.denies.some((d) => overlaps(d, action, resource)));
+      let beyond: { action: string; resource: string; why: 'team' | 'owner' | 'key'; problem?: string } | null = null;
       for (const r of tpl) {
-        if (r.effect !== 'allow') continue;
+        if (r.effect !== 'allow' || beyond) continue;
         for (const action of r.actions) {
-          if (!holds(action, r.resource)) throw err('denied', `The recruit template grants ${action} on ${r.resource}, which is more than the coordinator holds. Ask the administrator for a narrower template.`);
+          if (!heldWhole(action, r.resource)) { beyond = { action, resource: r.resource, why: 'team' }; break; }
+          if (owner && r.resource.startsWith('path:')) {
+            // Only the owner's Read actions count as reading; any other action on a path (rename, restore, delete,
+            // download, a wildcard) needs a Contribute grant. Without the onboarding hook the check fails closed.
+            const path = r.resource.slice(5).replace(/\/\*\*?$/, '') || '/';
+            const access = FOLDER_READ.includes(action) ? 'read' as const : 'write' as const;
+            const problem = this.ownerFolderProblems ? this.ownerFolderProblems(owner, [{ path, access }])[0] : 'the owner\'s folder grants cannot be checked';
+            if (problem) { beyond = { action, resource: r.resource, why: 'owner', problem }; break; }
+          }
+          if (!inCap(action, r.resource)) { beyond = { action, resource: r.resource, why: 'key' }; break; }
         }
       }
+      this.audit.event({ kind: 'agent', id: coordinatorId }, 'team.recruit_ceiling', { kind: 'team', id: t.id }, { template: t.recruit_template_id, owner, within: !beyond, ...(beyond ? { beyond } : {}), members: ceiling.length });
+      if (beyond?.why === 'team') throw err('denied', `The recruit template grants ${beyond.action} on ${beyond.resource}, which no member of the team${owner ? ' with the same owner' : ''} holds for good. Ask the operator for a narrower template.`);
+      if (beyond?.why === 'owner') throw err('denied', `The recruit template grants ${beyond.action} on ${beyond.resource}, outside the owner's folders (${beyond.problem}). Ask the operator for a narrower template.`);
+      if (beyond) throw err('denied', `The recruit template grants ${beyond.action} on ${beyond.resource}, which is outside what the coordinator's app key may do. Ask the operator for a narrower template.`);
       return [...tpl, ...denies];
     }
     const READ = ['fs.list', 'fs.read', 'fs.search', 'fs.history'];
@@ -2371,7 +2415,7 @@ export class Teams {
       const acts = READ.filter((x) => holds(x, r.resource));
       if (acts.length) out.push({ effect: 'allow', actions: acts, resource: r.resource, note: 'recruit: read-only copy of the coordinator' });
     }
-    if (out.length === 1) throw err('invalid_state', 'The coordinator has no vault access to share, and the team has no recruit template.');
+    if (out.length === 1) throw err('invalid_state', "The team has no recruit template, and the coordinator has no vault access of its own to copy. Ask the operator to choose a recruit template in the team's settings.");
     return [...out, ...denies];
   }
   private recruitCheck(t: TeamRow, a: { label: string; role: string; purpose: string }): void {
@@ -2415,8 +2459,10 @@ export class Teams {
     return r;
   }
   /** Where and how the recruit's key is picked up, for the coordinator or the operator. Never a key. */
-  static pickupText(label: string, p: RecruitPickup): string {
-    return `Its key is not shown anywhere: it waits for pickup on PC "${p.pc.name}" (request ${p.request_id}). The PC's user allows the new agent on the connector's screen within 24 hours; the connector then writes the key into its key file and builds the folder ${p.folder} beside the team's other folders. Start "${label}" in that folder. It joins the team when the pickup is confirmed.`;
+  /** `mark` wraps the agent-chosen label and folder as L2 text, for a notice (a tool result shows them as they are). */
+  static pickupText(label: string, p: RecruitPickup, mark = false): string {
+    const m = (t: string) => (mark ? l2(t) : `"${t}"`);
+    return `Its key is not shown anywhere: it waits for pickup on PC "${p.pc.name}" (request ${p.request_id}). The PC's connector picks it up within 24 hours; on a Hardened PC the PC's user allows the new agent on the connector's screen first. The connector then writes the key into its key file and builds the folder ${mark ? l2(p.folder) : p.folder} beside the team's other folders. Start ${m(label)} in that folder. It joins the team when the pickup is confirmed.`;
   }
   /** team_recruit: in 'auto' the agent exists at once and its key waits for pickup on the coordinator's PC; in 'propose' the administrator decides. */
   recruit(w: Who, a: { team_id: string; label: string; role: string; purpose: string }, via: { machineId: string | null } = { machineId: null }): { status: 'created' | 'pending'; agent_id?: string; request_id?: string; pickup?: RecruitPickup } {
@@ -2425,7 +2471,7 @@ export class Teams {
     this.beforeMembership?.(t.id);
     this.recruitCheck(t, a);
     const cred = this.keys.credential(w.credId);
-    const rules = this.recruitRules(t, cred ? this.keys.rules(cred.policy_id, false) : [], w.cap);
+    const rules = this.recruitRules(t, cred ? this.keys.rules(cred.policy_id, false) : [], w.cap, w.agentId);
     if (t.recruiting === 'propose') {
       const id = `rcr_${randomToken(10)}`;
       this.db.prepare("INSERT INTO recruit_requests(id,team_id,requested_by,label,role,purpose,status,created_at) VALUES (?,?,?,?,?,?,'pending',?)").run(id, t.id, w.agentId, a.label.trim(), a.role, a.purpose.slice(0, 500), Date.now());
@@ -2449,11 +2495,11 @@ export class Teams {
     if (!m) throw err('invalid_state', 'The requesting coordinator is no longer in the team.');
     this.beforeMembership?.(t.id);
     const cred = this.keys.credential(m.credential_id)!;
-    const rules = this.recruitRules(t, this.keys.rules(cred.policy_id, false), []);
+    const rules = this.recruitRules(t, this.keys.rules(cred.policy_id, false), [], q.requested_by);
     const r = this.performRecruit(t, q.requested_by, q, rules, actor, this.coordinatorPc(m.credential_id, null));
     this.db.prepare("UPDATE recruit_requests SET status='approved', agent_id=?, decided_at=? WHERE id=?").run(r.agent.id, Date.now(), id);
     this.audit.settle('recruit_request', t.id);
-    this.keys.notify(q.requested_by, 'recruit_decision', `Your request to recruit ${l2(q.label)} (${q.role}) was approved: agent ${r.agent.id} was created. ${Teams.pickupText(q.label, r.pickup)}`);
+    this.keys.notify(q.requested_by, 'recruit_decision', `Your request to recruit ${l2(q.label)} (${q.role}) was approved: agent ${r.agent.id} was created. ${Teams.pickupText(q.label, r.pickup, true)}`);
     return { agent: r.agent, pickup: r.pickup };
   }
   denyRecruit(id: string, note: string | null, actor: Actor): void {

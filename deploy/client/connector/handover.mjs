@@ -19,7 +19,8 @@ import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:pat
 import { lstatSync, realpathSync } from 'node:fs';
 import { readJson, atomicWrite, oneLine } from './paths.mjs';
 import { readKeyFile, stageAgentKey, commitStaged, discardStaged, labelHoldingKey } from './keyfile.mjs';
-import { pickupApproved, requestPickup, spendPickup, dropPickup } from './approvals.mjs';
+import { pickupApproved, requestPickup, allowOwnPickup, allowWithPickup, spendPickup, dropPickup } from './approvals.mjs';
+import { isHardened } from './isolation.mjs';
 import { foldersOfHub } from './registry.mjs';
 import { relRefusal } from './syncpath.mjs';
 import { hubCall, localLabel, buildAgent, defaultRoot, loadSetup } from './onboard.mjs';
@@ -132,6 +133,8 @@ export async function runHandovers(home, hubKey, { claudeJson, node, connector, 
     if (it.confirmed) return { phase: 'confirmed' };
     if (!it.pickup_id || it.keys_written_for !== it.pickup_id) {
       // A pickup hands over session keys, and the platform store opens for any process of this user: the PC's user clicks first.
+      // A recruit of a team the operator set to Automatic needs no click at the standard level (the hub says so with no_click); Hardened, a rotation and every other handover still wait for it.
+      if (!pickupApproved(home, hubKey, h.id) && h.kind === 'recruit' && h.no_click === true && !isHardened(home)) allowOwnPickup(home, hubKey, h.id, h.description ?? 'new agents', []);
       if (!pickupApproved(home, hubKey, h.id)) { requestPickup(home, hubKey, h.id, h.description ?? (h.kind === 'rotate' ? 'a rotated key' : 'new agents')); return { phase: 'waiting', pickup_click: true }; }
       const p = await hubCall(home, hubKey, 'POST', '/onboard/pickup', { request_id: h.id });
       const sec = readKeyFile(home).data?.hubs?.[hubKey] ?? section;
@@ -164,7 +167,7 @@ export async function runHandovers(home, hubKey, { claudeJson, node, connector, 
       const setup = { hub_id: section.hub_id, hub_key: hubKey, request: { root: place.root, project: place.project, client: place.client, kind: 'add_agents', team_id: it.team?.id ?? null, team_name: it.team?.name ?? null } };
       for (const a of it.agents) {
         if (a.built) continue;
-        try { a.dir = buildAgent(home, setup, a, { claudeJson, node, connector, gitBin }); a.built = true; a.error = null; } catch (e) { a.built = false; a.error = oneLine(e.message ?? String(e)).slice(0, 300); }
+        try { a.dir = buildAgent(home, setup, a, { claudeJson, node, connector, gitBin }); a.built = true; a.error = null; allowWithPickup(home, a.dir, { agent: a.label, agent_id: a.agent_id, hub_id: section.hub_id, ref: it.pickup_id }); } catch (e) { a.built = false; a.error = oneLine(e.message ?? String(e)).slice(0, 300); }
       }
       save(home, s);
     }

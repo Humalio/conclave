@@ -6,7 +6,7 @@
 import { platform } from 'node:os';
 
 const WIN = platform() === 'win32';
-const SECRET_RE = /(ah_(app|ses)_[a-z2-7]{12}_\S+|cnv_enrol_[a-z2-7]{26}|cnv_key_[a-z2-7]{26})/gi;
+const SECRET_RE = /(ah_(app|ses)_[a-z2-7]{12}_\S+|cnv_enrol_[a-z2-7]{26}|cnc-pair-[a-z2-7]{26}|cnv_key_[a-z2-7]{26})/gi;
 const LIMITS = { roles: 8, agents: 12, per_role: 5, rules: 20, requirements: 30, lines: 10, per_line: 10, papers: 20 };
 const PAPER_STATUSES = ['planned', 'drafting', 'submitted', 'accepted', 'published'];
 const PAPER_TYPES = ['paper', 'preprint', 'report', 'thesis'];

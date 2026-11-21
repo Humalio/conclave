@@ -392,6 +392,6 @@ describe('6. the console shows requirements and standard directives safely', () 
     expect(js).toContain('...(STD.length ? { standard } : {}), ...(E.requirements.length ? { requirements } : {})');
     expect(js).toContain("kd('Suggestions from agents'");
     expect(js).toContain('[r.agent_label, r.team_label, r.source');
-    expect(js).toContain("['max_requirements', 'Requirements'");
+    expect(js).toContain("['max_requirements', 'Requirements per request'");
   });
 });

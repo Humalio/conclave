@@ -34,8 +34,8 @@ export function registerDirectivesApi(api: FastifyInstance, d: DirectivesApiDeps
     return { directive: directives.create({ title: b.title, body: b.body, scope: { kind: b.scope.kind, ref: b.scope.ref ?? null }, source: b.source ?? 'console', category: b.category, tags: b.tags }, actor(req)) };
   });
   api.patch('/api/directives/:id', async (req) => {
-    const b = body(z.object({ title: z.string().min(1).max(120).optional(), body: z.string().min(1).max(20000).optional(), scope: scope.optional(), note: z.string().max(500).nullable().optional(), category: category.optional(), tags: tags.optional() }), req);
-    return { directive: directives.update(idOf(req), { title: b.title, body: b.body, scope: b.scope ? { kind: b.scope.kind, ref: b.scope.ref ?? null } : undefined, note: b.note ?? null, category: b.category, tags: b.tags }, actor(req)) };
+    const b = body(z.object({ title: z.string().min(1).max(120).optional(), body: z.string().min(1).max(20000).optional(), scope: scope.optional(), note: z.string().max(500).nullable().optional(), category: category.optional(), tags: tags.optional(), minor: z.boolean().optional() }), req);
+    return { directive: directives.update(idOf(req), { title: b.title, body: b.body, scope: b.scope ? { kind: b.scope.kind, ref: b.scope.ref ?? null } : undefined, note: b.note ?? null, category: b.category, tags: b.tags, minor: b.minor }, actor(req)) };
   });
   // Keep a registered rule; the category the agent proposed is confirmed unless the body gives one (null: none).
   api.post('/api/directives/:id/review', async (req) => ({ directive: directives.review(idOf(req), actor(req), body(z.object({ category: category.optional() }), req).category) }));

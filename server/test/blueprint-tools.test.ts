@@ -417,13 +417,19 @@ describe('writing for the operator (docs/blueprint.md §2.7)', () => {
     expect(await cite('The card shipped, see `server/public/app.js`.')).toEqual(['server/public/app.js']);
   });
 
-  it('the bp_write description tells the writer who reads it, and that nothing is refused for it', async () => {
+  it('the bp_write description stays short and points at the rules, which tell the writer who reads it and that nothing is refused for it', async () => {
     const c = new Client({ name: 'test', version: '1' });
     await c.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${appKey}` } } }));
-    const tool = (await c.listTools()).tools.find((t) => t.name === 'bp_write')!;
-    expect(tool.description).toContain('read by the operator, a person, in the console');
-    expect(tool.description).toContain('never refused');
-    expect(tool.description).toContain('Cite sources as [[note]] links to vault files.');
+    const tools = (await c.listTools()).tools;
+    const write = tools.find((t) => t.name === 'bp_write')!, read = tools.find((t) => t.name === 'bp_read')!;
+    expect(write.description).toContain('bp_read {rules: true}');
+    expect(write.description!.length).toBeLessThan(600);
+    expect(read.description!.length).toBeLessThan(600);
     await c.close();
+    const rules = ok(await WA('bp_read', { rules: true })).rules as string;
+    expect(rules).toContain('read by the operator, a person, in the console');
+    expect(rules).toContain('never refused');
+    expect(rules).toContain('Cite sources as [[note]] links to vault files.');
+    expect(rules).toContain('end one in * for the next number');
   });
 });

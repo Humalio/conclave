@@ -15,7 +15,8 @@ import { homedir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { readJson, atomicWrite, canonicalFolder, WIN, oneLine } from './paths.mjs';
 import { readKeyFile, putAgentKey, LABEL_RE } from './keyfile.mjs';
-import { pickupApproved, requestPickup, spendPickup, pickupDenied, allowWithPickup } from './approvals.mjs';
+import { pickupApproved, requestPickup, spendPickup, pickupDenied, allowWithPickup, allowOwnPickup } from './approvals.mjs';
+import { isHardened } from './isolation.mjs';
 import { connect, request } from './hubclient.mjs';
 import { registerFolder } from './register.mjs';
 import { record } from './manifest.mjs';
@@ -95,6 +96,28 @@ export async function fileRequest(home, hubKey, body, { check = false, root } = 
   delete s.pickup_id; delete s.confirmed;
   save(home, s);
   return { ok: true, request_id: res.request_id, state: res.state, summary: summary(body) };
+}
+
+/** `conclave setup choices`: what this PC may ask for, as the hub answers it (a PC code: the projects and teams; an invite: the invite). Nothing is stored. */
+export async function choices(home, hubKey) { return call(home, hubKey, 'GET', '/onboard/choices'); }
+
+/**
+ * `conclave setup redeem <invite id>`: redeems a collaborator's invite. The hub checks it again and files an approved request for this PC;
+ * the request is kept as this PC's own, so setup carries on from it (the pickup needs no click). The only choice made here is the local folder.
+ * `{ok: true, request_id, state}`, or `{ok: false, reason: 'invite_refused', message}` with the hub's plain reason.
+ */
+export async function redeemInvite(home, hubKey, inviteId, { root, client = 'claude-code', invite = null } = {}) {
+  const hubId = hubIdOf(home, hubKey);
+  const s = loadSetup(home, hubId);
+  if (s.request && !s.request.done && !['denied', 'withdrawn', 'cancelled', 'collected'].includes(s.request.state)) return { ok: false, reason: 'request_in_progress', message: 'A request is already in progress on this PC for this hub; continue setup first.' };
+  let res;
+  try { res = await call(home, hubKey, 'POST', `/onboard/invites/${encodeURIComponent(inviteId)}/redeem`, {}); } catch (e) { if (e.reason === 'invite_refused') return { ok: false, reason: 'invite_refused', message: oneLine(e.message ?? '') }; throw e; }
+  s.hub_key = hubKey;
+  s.request = { id: res.request_id, kind: 'add_agents', client, project: invite?.project ?? res.project ?? null, team_name: invite?.team?.name ?? res.team_name ?? null, state: res.state, version: res.version, root: resolve(root ?? defaultRoot()) };
+  s.agents = [];
+  delete s.pickup_id; delete s.confirmed;
+  save(home, s);
+  return { ok: true, request_id: res.request_id, state: res.state };
 }
 
 /**
@@ -206,11 +229,13 @@ export async function advance(home, hubKey, { waitS = 0, claudeJson, node, conne
     if (st.state === 'approved' && (!s.pickup_id || s.keys_written_for !== s.pickup_id)) {
       // At the standard level a pickup hands over session keys, and the platform store opens for any process of this user: the PC's user clicks first.
       if (!pickupApproved(home, hubKey, s.request.id) && pickupDenied(home, hubKey, s.request.id)) return { phase: 'waiting', stage: 'allow', declined: true, note: 'Declined on this PC. The PC user can still allow it on the connector screen.' };
+      // A request this PC filed picks up its keys by itself, with no click; at Hardened the PC user's click stays, since the keys are not theirs to open.
+      const what = `session keys for the approved team request ${s.request.team_name ?? s.request.id}`, where = (st.agents ?? []).map((x) => ({ agent: x.label ?? x.folder, path: folderOf(s, x) }));
+      if (!pickupApproved(home, hubKey, s.request.id) && !isHardened(home)) allowOwnPickup(home, hubKey, s.request.id, what, where);
       if (!pickupApproved(home, hubKey, s.request.id)) { requestPickup(home, hubKey, s.request.id, `session keys for the approved team request ${s.request.team_name ?? s.request.id}`, (st.agents ?? []).map((x) => ({ agent: x.label ?? x.folder, path: folderOf(s, x) }))); return { phase: 'waiting', stage: 'allow', pickup_click: true }; }
       const { section } = hubOf(home, hubKey);
       const taken = new Set(Object.keys(section.agents ?? {}));
       const p = await call(home, hubKey, 'POST', '/onboard/pickup', { request_id: s.request.id });
-      spendPickup(home, hubKey, s.request.id);
       s.pickup_id = p.pickup_id;
       s.request.team_name = p.team?.name ?? s.request.team_name;
       if (p.team?.id) s.request.team_id = p.team.id;
@@ -235,6 +260,9 @@ export async function advance(home, hubKey, { waitS = 0, claudeJson, node, conne
       }
     }
     s.confirmed = true; s.request.state = 'collected';
+    // The click covers this request until it is confirmed (docs/connector.md "Clicks": once per request), so a crash between
+    // pickup and confirm, or a pickup the hub replaced, picks up again without asking the PC user twice. Spent here.
+    spendPickup(home, hubKey, s.request.id);
     save(home, s);
   } else {
     for (const a of s.agents) if (!a.built) tryBuild(home, s, a, { claudeJson, node, connector, win, gitBin });

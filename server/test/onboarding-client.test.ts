@@ -296,10 +296,10 @@ describe('setup.mjs end to end', () => {
     expect(keys.length).toBeGreaterThanOrEqual(4);
     const all = outputs.join('\n');
     for (const k of keys) expect(all).not.toContain(k);
-    expect(all).not.toMatch(/ah_(app|ses)_[a-z2-7]{12}_|cnv_enrol_[a-z2-7]{26}/);
+    expect(all).not.toMatch(/ah_(app|ses)_[a-z2-7]{12}_|cnc-pair-[a-z2-7]{26}/);
     const state = readFileSync(join(conf, 'onboarding', 'state.json'), 'utf8');
     for (const k of keys) expect(state).not.toContain(k);
-    expect(state).not.toMatch(/ah_(app|ses)_|cnv_enrol_/);
+    expect(state).not.toMatch(/ah_(app|ses)_|cnc-pair-/);
   });
 });
 

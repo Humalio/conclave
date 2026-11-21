@@ -25,6 +25,7 @@ import { validateEntry, record, undoDecision, entries, noRedirect } from './conn
 import { registerFolder, repairFolder } from './connector/register.mjs';
 import { runCheck } from './connector/check.mjs';
 import { speakUp, withRequestId } from './connector/mcpserver.mjs';
+import { runHook } from './connector/hook.mjs';
 import { startBroker, askBroker, brokerAddress } from './connector/broker.mjs';
 import { brokerSecretPath, brokerProof } from './connector/brokerclient.mjs';
 import { connect as netConnect } from 'node:net';
@@ -579,6 +580,58 @@ describe('conclave mcp', { concurrency: false }, () => {
       assert.match(tls.msgs[0].result.instructions, /certificate does not match what this PC pinned/);
     } finally { await hub3.close(); }
   }, 60000);
+  test('a broker that passes the proof but names another hub address than the folder binding is refused with ca_changed, and no tool call is relayed', tlsOpts, async () => {
+    const pki = makePki('Origin CA'), hub = await stubHub(pki);
+    try {
+      const s = setup(pki, hub);
+      // The folder was bound to another address of the hub; the (verified) broker answers with this one.
+      bindFolder(s.home, s.folder, { hubId: s.hubId, caSha256: s.ca, agent: s.label, origin: 'https://127.0.0.1:1' });
+      assert.equal(resolveFolder(s.home, s.folder).binding.origin, 'https://127.0.0.1:1');
+      const r = await withBroker(s, () => runMcp(s, s.folder, [INIT, call(2, STATUS)]));
+      assert.match(r.msgs[0].result.instructions, new RegExp(line('ca_changed').replace(/[.*+?^${}()|[\]\\]/g, '\\$&').slice(0, 40)));
+      assert.match(r.log, /speaking-up ca_changed/);
+      assert.deepEqual(hub.requests.filter((q) => !String(q.tool).startsWith('turn_')), [], 'no tool call was relayed to the hub the broker named');
+      noSecrets(r);
+    } finally { await hub.close(); }
+  }, 30000);
+  test('a second connector start that cannot take the broker address fails and leaves the running broker, its secret and its proof alone', tlsOpts, async () => {
+    const pki = makePki('Second Broker CA'), hub = await stubHub(pki);
+    try {
+      const s = setup(pki, hub);
+      const b = await broker(s);
+      try {
+        const secret = readFileSync(brokerSecretPath(s.home), 'utf8');
+        await assert.rejects(() => startBroker({ home: s.home, deps: { renewMs: 3_600_000 } }), (e) => e.code === 'EADDRINUSE');
+        assert.equal(readFileSync(brokerSecretPath(s.home), 'utf8'), secret, 'the secret of the running broker was not replaced');
+        const a = await askBroker(s.home, { op: 'turn', folder: s.folder, pid: process.pid });
+        assert.equal(a.ok, true, 'the first broker still answers, and its proof is still accepted');
+      } finally { await b.close(); }
+    } finally { await hub.close(); }
+  }, 30000);
+  test('the hook hands the transcript path to the broker, so the end-of-turn key scan runs and a key found revokes the token as a leak', tlsOpts, async () => {
+    const pki = makePki('Hook Scan CA'), hub = await stubHub(pki);
+    try {
+      const s = setup(pki, hub);
+      let up = true;
+      const b = await broker(s, { alive: () => up });
+      try {
+        await askBroker(s.home, { op: 'turn', folder: s.folder, pid: process.pid });
+        const t = join(s.base, 'claude-transcript.jsonl');
+        writeFileSync(t, JSON.stringify({ role: 'assistant', text: `here is the key ${SES}` }) + '\n');
+        // What Claude Code sends the hook: the event and the transcript's path. Nothing here calls the broker's transcript op by hand.
+        await runHook(s.home, s.folder, JSON.stringify({ hook_event_name: 'UserPromptSubmit', transcript_path: t }));
+        const t0 = Date.now(); while (Date.now() - t0 < 5000 && !b.runs.get([...b.runs.keys()][0])?.transcript) await new Promise((r) => setTimeout(r, 25));
+        up = false;
+        await b.renewAll();
+        assert.equal(b.runs.size, 0);
+        assert.equal(hub.revoked.at(-1).reason, 'leak_found');
+      } finally { await b.close(); }
+    } finally { await hub.close(); }
+  }, 30000);
+  test('the docs say the scan covers Claude Code transcripts only, and that a Codex transcript is never scanned', () => {
+    const doc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'docs', 'connector.md'), 'utf8').replace(/\r\n/g, '\n');
+    assert.match(doc, /Codex transcripts are not scanned/);
+  });
   test('speak-up answers are valid JSON-RPC: notifications get nothing, unknown methods an error with the line', () => {
     assert.equal(speakUp({ jsonrpc: '2.0', method: 'notifications/initialized' }, 'no_hub_key'), null);
     assert.equal(speakUp({ jsonrpc: '2.0', id: 9, method: 'resources/list' }, 'no_hub_key').error.code, -32601);

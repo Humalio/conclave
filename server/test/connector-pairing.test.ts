@@ -1,6 +1,6 @@
 /**
  * Connector pairing on the hub (docs/connector.md, "Add PC: download and pairing"): one stable hub id; Add PC answers the
- * pairing block and a prompt with no code, or the reason there is none (no CA, no HTTPS origin), never the legacy prompt; the code pairs once, within 30 minutes, only for this hub's origin and CA; a
+ * pairing block with the code and a prompt without it (the agent pipes the code to the installer), or the reason there is none (no CA, no HTTPS origin), never the legacy prompt; the code pairs once, within 30 minutes, only for this hub's origin and CA; a
  * wrong binding voids it; a checkout's code is refused; every refusal is the same 401 sentence; the PC reads its own
  * setup timeline with its app key, Paired done from the moment the code was redeemed.
  */
@@ -65,14 +65,16 @@ describe('the hub identity', () => {
 });
 
 describe('Add PC and Re-enrol', () => {
-  it('answer the pairing block and a connector prompt with no code', async () => {
+  it('answer the pairing block with the code, and a connector prompt without it', async () => {
     const before = Date.now();
     const r = (await api('POST', '/pcs/add', { name: 'pair-add' })).body;
     expect(r.pairing).toMatchObject({ code: r.code, ca_check: caCheck(caSha), hub_origin: ORIGIN });
     expect(r.pairing.code_expires_at).toBeGreaterThanOrEqual(before + PAIRING_MS);
     expect(r.connector_prompt).toContain('conclave setup request --file <path> --check');
+    expect(r.connector_prompt).toContain(`node conclave-install-<version>.mjs --pair - --hub ${ORIGIN} --ca ${caSha}`);
     expect(r.connector_prompt).not.toContain(r.code);
-    expect(r.connector_prompt).not.toMatch(/cnv_/);
+    expect(r.connector_prompt).not.toMatch(/Claude/);
+    expect(r.connector_prompt).not.toMatch(/cnv_|cnc-pair-[a-z2-7]/); // no key and no code
     expect(r.connector_unavailable).toBeNull();
     expect(r).not.toHaveProperty('prompt'); // no legacy setup.mjs prompt beside it
     expect(r.connector_version).toBeNull(); // no approved version yet: the console says conclave-install-<version>.mjs
@@ -124,7 +126,7 @@ describe('POST /connector/v1/pair', () => {
     const again = await pair(r.code);
     expect(again).toEqual({ status: 401, body: { error: 'invalid_pairing_code', message: REFUSED } });
     expect(audits('connector.pair_refused').at(-1)).toMatchObject({ reason: 'used' });
-    expect(JSON.stringify(audits('connector.pair'))).not.toContain(r.code);
+    expect(JSON.stringify(audits('connector.paired'))).not.toContain(r.code);
   });
   it('a wrong CA or origin pairs nothing and voids the code', async () => {
     const a = (await api('POST', '/pcs/add', { name: 'pair-ca' })).body;
@@ -146,13 +148,13 @@ describe('POST /connector/v1/pair', () => {
     app.db.prepare('UPDATE enrolment_codes SET expires_at=? WHERE machine_id=?').run(Date.now() + PAIRING_MS, r.pc.id);
     expect(await pair(r.code)).toEqual({ status: 401, body: { error: 'invalid_pairing_code', message: REFUSED } });
     expect(audits('connector.pair_refused').at(-1)).toMatchObject({ reason: 'checkout_code' });
-    expect(await pair('cnv_enrol_' + 'a'.repeat(26))).toEqual({ status: 401, body: { error: 'invalid_pairing_code', message: REFUSED } });
+    expect(await pair('cnc-pair-' + 'a'.repeat(26))).toEqual({ status: 401, body: { error: 'invalid_pairing_code', message: REFUSED } });
     expect(await pair('nonsense')).toEqual({ status: 401, body: { error: 'invalid_pairing_code', message: REFUSED } });
   });
   it('rate-limits failures from one address', async () => {
     const from = freshIp();
     let last = 0;
-    for (let i = 0; i < 12; i++) last = (await pair('cnv_enrol_' + 'b'.repeat(26), {}, from)).status;
+    for (let i = 0; i < 12; i++) last = (await pair('cnc-pair-' + 'b'.repeat(26), {}, from)).status;
     expect(last).toBe(429);
   });
   it('the setup timeline needs the app key', async () => {

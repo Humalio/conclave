@@ -8,8 +8,10 @@ import { homedir, platform } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { confDir } from './paths.mjs';
+import { CONNECTOR_VERSION } from './version.mjs';
 
-export const VERSION = '0.4.0';
+/** The version the transfer loop reports to the hub's /bridge relay: the connector's own, since the connector runs this loop. */
+export const VERSION = CONNECTOR_VERSION;
 const CONFIG_DIR = process.env.AGENT_HUB_HOME ? path.resolve(process.env.AGENT_HUB_HOME) : path.join(homedir(), '.agent-hub');
 
 function safeWindowsPath(value) {
@@ -112,12 +114,13 @@ export function protectedFileReason(p) {
   const name = parts.at(-1) ?? '';
   const parent = parts.at(-2) ?? '';
   if (parts.some((x, i) => x === '.git' && parts[i + 1] === 'hooks' && i + 1 < parts.length - 1)) return 'a git hook';
-  if (parts.some((x) => x === 'git~1')) return 'a git folder under its short name';
+  if (parts.some((x) => x === 'git~1' || /^git~\d+$/.test(x))) return 'a git folder under its short name';
+  if (parts.some((x) => DEVICE_NAME.test(x))) return 'a Windows device name';
   if (name === 'config' && parent === '.git') return 'git settings';
   if (name === 'settings.json' && parent === '.claude') return 'Claude settings';
   if (name === 'settings.local.json' && parent === '.claude') return 'Claude settings';
   if (name === '.mcp.json') return 'MCP server settings';
-  if (name === 'config.toml' && parent === '.codex') return 'Codex settings';
+  if (name === 'config.toml' && (parent === '.codex' || SHORT_NAME.exec(parent)?.[1] === 'codex')) return 'Codex settings';
   if (name === 'agents.override.md') return 'an override of agent instructions';
   if (name === 'claude.md' || name === 'agents.md') return 'agent instructions (a role file)';
   return null;
@@ -197,8 +200,23 @@ export const AGENT_FROM = 'Files may come only from inside your own folder on th
  * real paths, not in a `.git` or `.codex` folder on the way, not be a role file at the folder's root, and not reach the
  * connector's own folders (`refusedDirs`, and the bridge configuration folder) under any spelling.
  */
+/** A path segment as Windows reads it: an alternate stream cut off, trailing dots and spaces dropped, case folded. */
+const canonSegment = (s) => String(s).normalize('NFC').toLowerCase().replace(/:[^\\/]*$/, '').replace(/[. ]+$/, '');
+const SHORT_NAME = /^([^~.]{1,6})~\d+(?:\.[^.]{0,3})?$/;
+const DEVICE_NAME = /^(?:con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$/;
+/** True for .git or .codex under any Windows spelling: `.git.`, `.git `, `GIT~1`, `CODEX~1`. */
+const isGitOrCodex = (seg) => { const n = canonSegment(seg); return n === '.git' || n === '.codex' || ['git', 'codex'].includes(SHORT_NAME.exec(n)?.[1]); };
+/** Why a path's own spelling is refused whatever it points to (a Windows device name, or another spelling of .git or .codex), or null. */
+export function spellingRefusal(p) {
+  const parts = String(p).split(/[\\/]+/).filter(Boolean);
+  if (parts.some((s) => DEVICE_NAME.test(canonSegment(s)))) return 'a Windows device name';
+  if (parts.some((s) => isGitOrCodex(s) && !['.git', '.codex'].includes(s.toLowerCase()))) return 'inside .git or .codex (under another spelling)';
+  return null;
+}
 export async function agentPathRefusal(target, folders, refusedDirs = [], os = platform()) {
   if (typeof target !== 'string' || !path.isAbsolute(target) || target.includes('\0')) return 'not an absolute path';
+  const spelled = spellingRefusal(target);
+  if (spelled) return spelled;
   let real;
   try { real = await fs.realpath(target); } catch (e) { return e?.code === 'ENOENT' ? 'no such file' : 'the path cannot be read'; }
   if (await inConfigDir(real).catch(() => true)) return 'inside the connector\'s own folder';
@@ -209,9 +227,9 @@ export async function agentPathRefusal(target, folders, refusedDirs = [], os = p
   for (const f of folders ?? []) {
     const root = await fs.realpath(f).catch(() => null);
     if (!root || !isInside(real, root, os)) continue;
-    const parts = path.relative(root, real).split(path.sep).filter(Boolean).map((s) => s.toLowerCase());
-    if (parts.some((s) => s === '.git' || s === '.codex')) return 'inside .git or .codex';
-    if (parts.length === 1 && ROLE_FILES.has(parts[0])) return 'a role file';
+    const parts = path.relative(root, real).split(path.sep).filter(Boolean);
+    if (parts.some(isGitOrCodex)) return 'inside .git or .codex';
+    if (parts.length === 1 && (ROLE_FILES.has(canonSegment(parts[0])) || ['claude', 'agents'].includes(SHORT_NAME.exec(canonSegment(parts[0]))?.[1]))) return 'a role file';
     return null;
   }
   return 'outside your own folder';
@@ -286,7 +304,8 @@ async function walk(dir, prefix, out, chain, check) {
     const rel = prefix ? `${prefix}/${d.name}` : d.name;
     if (isDir) await walk(abs, rel, out, here, check);
     else {
-      await check(abs);
+      // A role file at the root of the folder being sent is left out of a whole-folder send (sent alone, it is refused).
+      try { await check(abs); } catch (e) { if (e?.roleFile) continue; throw e; }
       const stat = await fs.lstat(abs);
       if (!stat.isFile()) throw new Fatal('source changed while planning transfer');
       addEntry(out, { abs, rel, size: stat.size, stat });
@@ -370,11 +389,11 @@ async function sendJob(job, ctx) {
   let check = (p) => requirePath(p, allowed);
   if (ctx.agentFolders) {
     // The connector: only the sending agent's own folder, whatever folders the hub approved for the PC.
-    const folders = job.agent ? ctx.agentFolders(job.agent) : [];
+    const folders = job.agent || job.agent_id ? ctx.agentFolders({ agent: job.agent, agent_id: job.agent_id }) : [];
     if (!folders.length) throw new Fatal(`This PC has no folder registered for ${job.agent ? 'you' : 'the sender'} on this hub. ${AGENT_FROM}`);
     check = async (p) => {
       const why = await agentPathRefusal(p, folders, ctx.refusedDirs ?? []);
-      if (why) throw new Fatal(`${path.basename(String(p))}: ${why}. ${AGENT_FROM}`);
+      if (why) { const e = new Fatal(`${path.basename(String(p))}: ${why}. ${AGENT_FROM}`); e.roleFile = why === 'a role file'; throw e; }
     };
   }
   const plan = await buildPlan(paths, raw, check);
@@ -425,12 +444,17 @@ async function sendJob(job, ctx) {
  * junction into another agent's folder is refused), and the target need not exist yet.
  */
 export function foreignFoldersOf(bindings, who, idOf = () => null) {
-  return bindings.filter((b) => {
-    const id = b.agent_id ?? idOf(b);
-    // A job that names its receiver by id: a binding whose id is unknown is foreign (fails closed; labels can be shared by two teams).
-    if (who?.agent_id) return id ? id !== who.agent_id : true;
-    return b.agent !== who?.agent;
-  }).map((b) => b.path);
+  return bindings.filter((b) => !isAgentsBinding(b, who, idOf)).map((b) => b.path);
+}
+/** The folders registered for the agent `who` (`{agent, agent_id}` from the job): the same match, seen from the other side. */
+export function ownFoldersOf(bindings, who, idOf = () => null) {
+  return bindings.filter((b) => isAgentsBinding(b, who, idOf)).map((b) => b.path);
+}
+// A job that names its agent by id matches a binding by id only (an unknown id is no match: labels can be shared by two
+// teams on one PC); a job without an id (an older hub) matches by label.
+function isAgentsBinding(b, who, idOf) {
+  if (who?.agent_id) { const id = b.agent_id ?? idOf(b); return !!id && id === who.agent_id; }
+  return who?.agent !== undefined && b.agent === who.agent;
 }
 
 export async function foreignFolderRefusal(target, who, foreignFolders, os = platform()) {
@@ -677,14 +701,14 @@ function validJob(job) {
     ['send', 'receive'].includes(job.kind) && job.id === `${job.channel_id}:${job.kind}` &&
     ['raw', 'tar'].includes(job.framing) &&
     (job.kind === 'receive' ? typeof job.save_to === 'string' && (job.agent === undefined || (typeof job.agent === 'string' && AGENT_RE.test(job.agent))) && (job.agent_id === undefined || (typeof job.agent_id === 'string' && AGENT_RE.test(job.agent_id))) :
-      (job.agent === undefined || (typeof job.agent === 'string' && AGENT_RE.test(job.agent))) &&
+      (job.agent === undefined || (typeof job.agent === 'string' && AGENT_RE.test(job.agent))) && (job.agent_id === undefined || (typeof job.agent_id === 'string' && AGENT_RE.test(job.agent_id))) &&
       (Array.isArray(job.local_paths) ? job.local_paths.length > 0 && job.local_paths.every((p) => typeof p === 'string') : typeof job.local_path === 'string'));
 }
 
 /**
  * The poll and transfer loop for one hub. `key` is the bridge key, or the PC's app key when the connector's service runs
  * it; `fetch` is then the connector's pinned fetch, which reaches only that hub over its pinned CA. The connector also gives
- * `agentFolders(label)`, the folders registered for that agent on this hub, and `refusedDirs`, its own folders: a send
+ * `agentFolders({agent, agent_id})`, the folders registered for that agent on this hub, and `refusedDirs`, its own folders: a send
  * then reads only from the sending agent's folder (agentPathRefusal).
  */
 export async function runLoop({ hub, key, signal, fetch: fetchImpl = fetch, log = logLine, agentFolders = null, foreignFolders = null, refusedDirs = [] }) {
@@ -693,7 +717,7 @@ export async function runLoop({ hub, key, signal, fetch: fetchImpl = fetch, log 
   let failures = 0;
   const running = new Map();
   const api = makeApi(cfg, signal, fetchImpl);
-  log(`bridge ${VERSION} running against ${cfg.hub}`);
+  log(`transfers ${VERSION} running against ${cfg.hub}`);
   try {
     while (!signal.aborted) {
       try {

@@ -19,7 +19,7 @@ Conclave's project Blueprint holds the operator's backlog, decisions, and verifi
 
 | Requirement | Platform contract | Reference |
 |---|---|---|
-| `FR-ONB-01`–`03` | Onboard a PC with an operator-issued prompt and one pending request per app key. Exchange the enrolment code through the client helper and keep long-lived secrets out of model-visible material. | [Onboarding](onboarding.md) |
+| `FR-ONB-01`–`03` | Onboard a PC with an operator-issued prompt and one pending request per app key. Pair the connector with a single-use code given apart from the prompt, and keep long-lived secrets out of model-visible material. | [Onboarding](onboarding.md) |
 | `FR-ONB-04`–`07` | Review project, roles, and access in one approval. Treat proposed rules and requirements as data until the operator acts. Let the setup client wait and pick up credentials, verify the setup, and confirm membership before starting an approved team. Support PC-bound and portable session keys. | [Onboarding](onboarding.md), [Directives](directives.md#from-onboarding) |
 | `FR-TEAM-01`–`03` | Apply the project's task intake rules. Keep backlog acceptance, discard, and demotion under administrator control. Enforce role and version checks on assignment, claiming, and start. Track on-demand team work and leave agent process execution with the local client or connector. | [Task lifecycle](specification.md#task-lifecycle), [MCP](mcp.md#team-modes) |
 | `FR-TEAM-04`–`08`, `12`–`14` | Tie review to the current submission and any published share version it names. Support resubmission and withdrawal. Keep self-review forbidden and apply the configured review and completion checkpoints. | [Task lifecycle](specification.md#task-lifecycle), [Acceptance](acceptance.md#collaboration-and-teams) |

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { bindFolder } from './connector/registry.mjs';
 import { procStartMs } from './connector/processes.mjs';
-import { createWake, setRunEnv, setProfileOf, setWake, promptFor, readRun, runEnvironment, WAKE_CAP_MS } from './connector/wake.mjs';
+import { createWake, setRunEnv, setProfileOf, setWake, promptFor, readRun, codexLimitAt, runEnvironment, WAKE_CAP_MS } from './connector/wake.mjs';
 import { clientProgram } from './connector/entries.mjs';
 import { EventEmitter } from 'node:events';
 import { addProfile, bindAgent } from './connector/profiles.mjs';
@@ -29,12 +29,14 @@ const fakeDir = mk();
 const FAKE = join(fakeDir, 'fake-claude.mjs');
 writeFileSync(FAKE, `
 import { readFileSync, appendFileSync, existsSync } from 'node:fs';
-const [, , mode, sid, argsLog] = process.argv;
+const [, , mode, sid, argsLog, how] = process.argv;
+if (mode === 'noresume' && how === 'resume') { appendFileSync(argsLog, JSON.stringify({ argv: process.argv.slice(2), env: {} }) + '\\n'); await new Promise((r) => setTimeout(r, 150)); process.exit(1); }
 appendFileSync(argsLog, JSON.stringify({ argv: process.argv.slice(2), env: { PROFILE: process.env.WAKE_PROFILE ?? null, hasKey: Object.keys(process.env).some((k) => /^ah_(app|ses)_/.test(String(process.env[k]))), paid: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CODEX_API_KEY'].filter((k) => process.env[k]), config: process.env.CLAUDE_CONFIG_DIR ?? null, hasPath: !!(process.env.PATH ?? process.env.Path) } }) + '\\n');
 const line = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
 line({ type: 'system', subtype: 'init', session_id: sid });
 if (mode === 'hang') setInterval(() => {}, 1000);
 else if (mode === 'limit') { line({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: Number(process.env.WAKE_RESETS) } }); line({ type: 'result', is_error: true, session_id: sid, permission_denials: [] }); }
+else if (mode === 'codexlimit') { line({ type: 'turn.failed', error: { message: process.env.WAKE_MSG || 'x' } }); }
 else if (mode === 'denial') line({ type: 'result', is_error: false, session_id: sid, permission_denials: [{ tool_name: 'Bash' }] });
 else line({ type: 'result', is_error: false, session_id: sid, permission_denials: [] });
 `);
@@ -98,13 +100,78 @@ describe('a turn starts for the agent', () => {
     assert.notEqual(w.started()[2].argv[1], first.argv[1]);
   });
 
-  test('an item with no task gets a fresh short run each time', async () => {
+  test('an item with no task resumes the agent\'s inbox session instead of paying for a fresh one each time', async () => {
     const w = world();
     await w.wake.onDeliver(w.ctx, w.order(1, 'agent-dev', [item(null, 'message')]), ORDER_REASONS); await w.idle();
     await w.wake.onDeliver(w.ctx, w.order(2, 'agent-dev', [item(null, 'decision')]), ORDER_REASONS); await w.idle();
-    assert.deepEqual(w.started().map((s) => s.argv[3]), ['fresh', 'fresh']);
-    assert.notEqual(w.started()[0].argv[1], w.started()[1].argv[1]);
+    const s = w.started();
+    assert.deepEqual(s.map((x) => x.argv[3]), ['fresh', 'resume']);
+    assert.equal(s[1].argv[1], s[0].argv[1], 'the same session');
+    assert.equal(w.wake.state('hk').agents['agent-dev'].inbox.id, s[0].argv[1]);
+    // a task item keeps its own session and never touches the inbox
+    await w.wake.onDeliver(w.ctx, w.order(3, 'agent-dev', [item(TASK_A)]), ORDER_REASONS); await w.idle();
+    assert.equal(w.started()[2].argv[3], 'fresh');
+    assert.notEqual(w.started()[2].argv[1], s[0].argv[1]);
+    assert.equal(w.wake.state('hk').agents['agent-dev'].inbox.id, s[0].argv[1]);
   });
+
+  test('an inbox session older than 12 hours starts fresh and the new session is remembered', async () => {
+    const w = world();
+    await w.wake.onDeliver(w.ctx, w.order(1, 'agent-dev', [item(null, 'message')]), ORDER_REASONS); await w.idle();
+    w.state.t += 12 * 3600_000 + 1000;
+    await w.wake.onDeliver(w.ctx, w.order(2, 'agent-dev', [item(null, 'message')]), ORDER_REASONS); await w.idle();
+    const s = w.started();
+    assert.deepEqual(s.map((x) => x.argv[3]), ['fresh', 'fresh']);
+    assert.notEqual(s[1].argv[1], s[0].argv[1]);
+    assert.equal(w.wake.state('hk').agents['agent-dev'].inbox.id, s[1].argv[1]);
+    w.state.t += 3600_000; // one hour on: young enough again
+    await w.wake.onDeliver(w.ctx, w.order(3, 'agent-dev', [item(null, 'message')]), ORDER_REASONS); await w.idle();
+    assert.equal(w.started()[2].argv[3], 'resume');
+  });
+
+  test('a resume the client cannot do falls back to a fresh session with the same items, once, and the inbox moves on', async () => {
+    const w = world();
+    await w.wake.onDeliver(w.ctx, w.order(1, 'agent-dev', [item(null, 'message')]), ORDER_REASONS); await w.idle();
+    w.state.mode = 'noresume';
+    await w.wake.onDeliver(w.ctx, w.order(2, 'agent-dev', [item(null, 'decision')]), ORDER_REASONS);
+    await w.until(() => w.started().length >= 3); await w.idle();
+    const s = w.started();
+    assert.deepEqual(s.map((x) => x.argv[3]), ['fresh', 'resume', 'fresh']);
+    assert.equal(s[2].argv[4], promptFor([item(null, 'decision')], null), 'the fresh run carries the items the resume was for');
+    assert.notEqual(s[2].argv[1], s[0].argv[1]);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(w.started().length, 3, 'no loop');
+    assert.equal(w.wake.state('hk').agents['agent-dev'].inbox.id, s[2].argv[1]);
+  });
+
+  test('a reason order starts fresh and leaves the inbox alone, and a reset forgets the inbox', async () => {
+    const w = world();
+    await w.wake.onDeliver(w.ctx, w.order(1, 'agent-dev', [item(null, 'message')]), ORDER_REASONS); await w.idle();
+    const inbox = w.wake.state('hk').agents['agent-dev'].inbox.id;
+    await w.wake.onDeliver(w.ctx, w.order(2, 'agent-dev', [], { reason: 'team_start' }), ORDER_REASONS); await w.idle();
+    assert.equal(w.started()[1].argv[3], 'fresh');
+    assert.equal(w.wake.state('hk').agents['agent-dev'].inbox.id, inbox);
+    recordReset(w.home, 'hk', 'agent-dev', 'pca_reset9');
+    await w.wake.onDeliver(w.ctx, w.order(3, 'agent-dev', [item(null, 'message')]), ORDER_REASONS); await w.idle(); // resumes, and the reset is applied when it ends
+    assert.equal(w.wake.state('hk').agents['agent-dev'].inbox, undefined, 'the reset dropped it');
+    await w.wake.onDeliver(w.ctx, w.order(4, 'agent-dev', [item(null, 'message')]), ORDER_REASONS); await w.idle();
+    assert.equal(w.started().at(-1).argv[3], 'fresh');
+  });
+
+  test('the prompt names only what waits and asks for the session_ack; a retry never says a message arrived', () => {
+    const p = (items, task) => promptFor(items, task);
+    assert.match(p([item(TASK_A)], TASK_A), /Call task_list \{task_id: "task_aaaa1111"\} for the details/);
+    assert.doesNotMatch(p([item(TASK_A)], TASK_A), /message_read/);
+    assert.match(p([item(null, 'message')], null), /Call message_read for the details/);
+    assert.doesNotMatch(p([item(null, 'message')], null), /task_list/);
+    assert.match(p([item(null, 'decision')], null), /Call team_decisions for the details/);
+    assert.match(p([item(null, 'message'), item(null, 'decision')], null), /Call message_read and team_decisions/);
+    for (const x of [p([item(TASK_A)], TASK_A), p([item(null, 'message')], null), p([{ notice: 'retry' }], TASK_A)]) assert.match(x, /confirm the notices you handled with session_ack/);
+    assert.doesNotMatch(p([{ notice: 'retry' }], TASK_A), /message arrived/);
+    assert.doesNotMatch(p([{ notice: 'limit' }], null), /message arrived/);
+    assert.match(p([{ notice: 'retry' }], TASK_A), /still waits on you/);
+  });
+
 
   test('the prompt is fixed words and ids only, and the run holds no key and needs no click', async () => {
     const w = world();
@@ -361,9 +428,43 @@ describe('a plan usage limit', () => {
     writeFileSync(f, JSON.stringify({ type: 'result', is_error: true, result: 'Claude usage limit reached, resets at 3pm' }) + '\n');
     assert.equal(readRun(f).limit, null, 'words alone are not a limit');
     writeFileSync(f, JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: 1900000000 } }) + '\n');
-    assert.equal(readRun(f).limit, 1900000000_000);
+    assert.equal(readRun(f, 1899999000_000).limit, 1900000000_000);
     writeFileSync(f, JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', resetsAt: 1900000000 } }) + '\n');
     assert.equal(readRun(f).limit, null);
+  });
+});
+
+describe('a Codex usage limit', () => {
+  const T0 = 1_800_000_000_000;
+  test('is read from the run error events: its own reset time, else the try-again delay, else an hour; never from agent text', () => {
+    const f = join(mk(), 'o.jsonl'), at = (o) => { writeFileSync(f, JSON.stringify(o) + '\n'); return readRun(f, T0).limit; };
+    assert.equal(at({ type: 'turn.failed', error: { message: "You've hit your usage limit. Try again in 2 hours 5 minutes." } }), T0 + (2 * 3600 + 5 * 60) * 1000);
+    assert.equal(at({ type: 'error', message: 'You have hit your usage limit', resets_in_seconds: 90 }), T0 + 90_000);
+    assert.equal(at({ type: 'error', message: 'usage limit reached', resets_at: (T0 + 7200_000) / 1000 }), T0 + 7200_000);
+    assert.equal(at({ type: 'turn.failed', error: { message: 'You hit your usage limit.' } }), T0 + 3600_000, 'no reset given: one hour');
+    assert.equal(at({ type: 'turn.failed', error: { message: 'network down' } }), null, 'another failure is not a limit');
+    assert.equal(at({ type: 'item.completed', item: { type: 'agent_message', text: 'I hit my usage limit, try again in 5 hours' } }), null, 'agent text is not a limit');
+    assert.equal(codexLimitAt({ type: 'result' }, T0), null);
+    // A reset in the wrong unit or absurdly far away is cut to 8 days, for Codex and for Claude alike.
+    assert.equal(at({ type: 'error', message: 'usage limit', resets_at: T0 }), T0 + 8 * 86400_000, 'milliseconds read as seconds');
+    assert.equal(at({ type: 'turn.failed', error: { message: 'usage limit, try again in 400 days' } }), T0 + 8 * 86400_000);
+    writeFileSync(f, JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: 9e12 } }) + '\n');
+    assert.equal(readRun(f, T0).limit, T0 + 8 * 86400_000);
+  });
+  test('pauses the profile like the Claude limit: held wakes wait for the reset, then the same session resumes', async () => {
+    const w = world({ mode: 'codexlimit', hub: { env: { WAKE_MSG: "You've hit your usage limit. Try again in 2 hours." } } });
+    setProfileOf(() => 'codex-work');
+    try {
+      await w.wake.onDeliver(w.ctx, w.order(1, 'agent-dev', [item(TASK_A)]), ORDER_REASONS); await w.idle();
+      const paused = w.sent('/wake/report').find((c) => c.body.state === 'paused_usage');
+      assert.ok(paused && paused.body.resumes_at >= w.state.t + 7200_000 && paused.body.resumes_at <= w.state.t + 7200_000 + 4 * 60_000, 'resumes at the reset, spread over a few minutes');
+      const o = await w.wake.onDeliver(w.ctx, w.order(2, 'agent-dev2', [item(TASK_B)]), ORDER_REASONS);
+      assert.equal(o.state, 'open', 'another agent on the profile waits, its order stays open');
+      assert.equal(w.started().length, 1);
+      w.state.mode = 'quick'; w.state.t = paused.body.resumes_at + 1000;
+      await w.wake.tick(w.ctx); await w.idle(); await w.idle('agent-dev2');
+      assert.equal(w.started().filter((s) => s.argv[3] === 'resume').length, 1, 'the same session resumes');
+    } finally { setProfileOf(null); }
   });
 });
 
@@ -545,6 +646,31 @@ describe('a woken run starts safely (wake-safety)', () => {
     const r = await f.wake.onDeliver(f.ctx, f.order(1, 'agent-dev', [item(TASK_A)]), ORDER_REASONS);
     assert.equal(r.state, 'open');
     assert.equal(f.started().length, 0);
+  });
+
+  test('work that waited behind a turn stays queued and its order open while the program cannot start, and starts once it can', async () => {
+    let broken = false;
+    const w = world({ mode: 'hang', hub: { bin: () => (broken ? null : process.execPath), program: () => (broken ? null : process.execPath) } });
+    await w.wake.onDeliver(w.ctx, w.order(1, 'agent-dev', [item(TASK_A)]), ORDER_REASONS);
+    await w.until(() => w.started().length === 1);
+    const r = await w.wake.onDeliver(w.ctx, w.order(2, 'agent-dev', [item(TASK_B)]), ORDER_REASONS); // waits behind task A
+    assert.equal(w.wake.state('hk').agents['agent-dev'].queue.length, 1);
+    broken = true;
+    const pid = w.wake.state('hk').agents['agent-dev'].run.pid;
+    process.kill(pid); // the running turn ends; the waiting one is next, but the program cannot start
+    await w.until(() => !w.wake.state('hk').agents['agent-dev'].run);
+    await w.wake.tick(w.ctx); await w.wake.finishAll();
+    const a = w.wake.state('hk').agents['agent-dev'];
+    assert.equal(a.run, null, 'nothing runs');
+    assert.equal(a.queue.length, 1, 'the work stays queued');
+    assert.equal(w.sent('/orders/pca_2/result').length, 0, 'its order is not answered: it stays open');
+    assert.equal(w.started().length, 1, 'no second turn started');
+    broken = false; w.state.mode = 'quick';
+    await w.wake.tick(w.ctx); await w.idle();
+    assert.equal(w.started().length, 2, 'it started once the program could');
+    assert.ok(w.sent('/orders/pca_2/result').some((c) => c.body.state === 'done'));
+    assert.equal(w.wake.state('hk').agents['agent-dev'].queue.length, 0);
+    void r;
   });
 
   test('stopFolder ends the wake run in that folder only, and says whether there was one', async () => {

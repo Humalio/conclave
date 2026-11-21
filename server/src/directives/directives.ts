@@ -23,6 +23,7 @@ import { KeyError } from '../keys/keys.js';
 import type { Audit, Actor } from '../audit/audit.js';
 import type { Teams } from '../teams/teams.js';
 import { randomToken } from '../util/crypto.js';
+import { l2 } from '../notices/l2.js';
 
 export type ScopeKind = 'hub' | 'project' | 'team' | 'role' | 'agent';
 /** The fixed category list (migration 0024 checks it too). Order is the console's order. */
@@ -457,7 +458,12 @@ export class Directives {
    * alone are the operator's filing: no new version and no notice (categorize). An edit is a review, so a category the
    * agent proposed is taken unless one is given.
    */
-  update(id: string, a: { title?: string; body?: string; scope?: Scope; note?: string | null; category?: string | null; tags?: string[] }, actor: Actor): DirectiveRow {
+  /**
+   * Edit a directive: a new version, and every agent it reaches is told to read it again. minor (the operator's "Minor edit",
+   * a typo): the new version is kept and audited, but no agent is told, and an agent that had read the previous version
+   * counts as having read this one. A scope change is never minor: who it reaches changes.
+   */
+  update(id: string, a: { title?: string; body?: string; scope?: Scope; note?: string | null; category?: string | null; tags?: string[]; minor?: boolean }, actor: Actor): DirectiveRow {
     const d = this.must(id);
     if (d.status !== 'active') throw err('invalid_state', 'Retired directives cannot be edited.');
     const title = a.title?.trim() || d.title, body = a.body?.trim() || d.body, s = a.scope ? this.checkScope(a.scope) : { kind: d.scope_kind, ref: d.scope_ref };
@@ -465,15 +471,19 @@ export class Directives {
       if (a.category !== undefined || a.tags !== undefined) this.categorize([id], { category: a.category, tags: a.tags }, actor);
       return this.must(id);
     }
+    if (a.minor && (s.kind !== d.scope_kind || s.ref !== d.scope_ref)) throw err('invalid_argument', 'A change of who the directive applies to cannot be a minor edit: the agents it reaches are told.');
     const category = a.category !== undefined ? checkCategory(a.category) : d.category ?? (d.reviewed_at ? null : d.proposed_category);
     const tags = a.tags !== undefined ? normTags(a.tags) : d.tags;
     const before = new Set(this.reach(d).map((x) => x.id)), now = Date.now(), v = d.version + 1;
     tx(this.db, () => {
       this.db.prepare('UPDATE directives SET title=?, body=?, scope_kind=?, scope_ref=?, version=?, updated_at=?, reviewed_at=?, category=?, tags=?, proposed_category=NULL WHERE id=?').run(title, body, s.kind, s.ref, v, now, now, category, JSON.stringify(tags), id);
       this.version({ id, version: v, title, body, scope_kind: s.kind, scope_ref: s.ref, category, tags }, a.note ?? null, actor.id, now);
+      // A minor edit: whoever had read the previous version stays current (their acknowledgement moves to this version).
+      if (a.minor) this.db.prepare('UPDATE directive_acks SET version=? WHERE directive_id=? AND version=?').run(v, id, d.version);
     });
     const nd = this.must(id);
-    this.audit.event(actor, 'directive.update', { kind: 'directive', id }, { version: v, note: a.note ?? null });
+    this.audit.event(actor, 'directive.update', { kind: 'directive', id }, { version: v, note: a.note ?? null, ...(a.minor ? { minor: true } : {}) });
+    if (a.minor) return nd;
     // Every agent it reaches now is told; agents the new scope no longer covers are told to stop following it.
     this.reachChange(nd, before, { what: body !== d.body ? `Changed directive${a.note ? ` (${a.note})` : ''}:` : 'Directive now applies to you:', title: d.title });
     return nd;
@@ -599,7 +609,7 @@ export class Directives {
     let d: DirectiveRow;
     if (a.directive_id) d = this.must(a.directive_id);
     else {
-      const body = a.body?.trim() || r.text?.trim() || '';
+      const body = a.body?.trim() || r.text?.trim() || r.summary?.trim() || ''; // one-click Adopt (Needs you) sends no text: the summary every report has stands in
       if (!body) throw err('invalid_argument', 'Give the directive\'s text: the agent did not send it.');
       d = this.create({ title: a.title?.trim() || r.title, body, scope: a.scope ?? (team ? { kind: 'team', ref: team } : { kind: 'agent', ref: r.agent_id }),
         source: r.source ?? `reported by ${this.keys.agent(r.agent_id)?.label ?? r.agent_id}`, category: a.category !== undefined ? a.category : r.category }, actor);
@@ -614,8 +624,8 @@ export class Directives {
     const R = this.resolver();
     for (const x of [r, ...same]) {
       const ag = this.keys.agent(x.agent_id);
-      if (ag && R.applies(d, ag)) this.keys.notify(x.agent_id, 'directive_changed', `"${x.title}", which you reported following, is now hub directive ${d.id} ("${d.title}", v${d.version}, for ${this.scopeLabel(d)}). Follow the hub's version from now on: directives_read {id: "${d.id}", ack: true}.`, confirmRef(d));
-      else this.keys.notify(x.agent_id, 'directive_changed', `The operator recorded "${x.title}", which you reported following, as hub directive ${d.id}. It does not apply to you.`, stopRef(d.id));
+      if (ag && R.applies(d, ag)) this.keys.notify(x.agent_id, 'directive_changed', `${l2(x.title)}, which you reported following, is now hub directive ${d.id} ("${d.title}", v${d.version}, for ${this.scopeLabel(d)}). Follow the hub's version from now on: directives_read {id: "${d.id}", ack: true}.`, confirmRef(d));
+      else this.keys.notify(x.agent_id, 'directive_changed', `The operator recorded ${l2(x.title)}, which you reported following, as hub directive ${d.id}. It does not apply to you.`, stopRef(d.id));
     }
     this.audit.event(actor, 'directive.report_adopt', { kind: 'directive_report', id: reportId }, { directive: d.id, merged: same.map((x) => x.id) });
     return { report: this.report_(reportId), directive: d, merged: same.length };
@@ -625,7 +635,7 @@ export class Directives {
     const r = this.report_(reportId);
     if (r.status !== 'open') throw err('invalid_state', `The report is ${r.status}.`);
     this.db.prepare("UPDATE directive_reports SET status='retired', note=?, decided_at=? WHERE id=?").run(note, Date.now(), reportId);
-    this.keys.notify(r.agent_id, 'directive_changed', `Stop following "${r.title}"${r.source ? ` (${r.source})` : ''}: the operator retired it${note ? `: ${note}` : '.'}`, stopRef(reportId));
+    this.keys.notify(r.agent_id, 'directive_changed', `Stop following ${l2(r.title)}${r.source ? ` (${l2(r.source)})` : ''}: the operator retired it${note ? `: ${note}` : '.'}`, stopRef(reportId));
     this.audit.event(actor, 'directive.report_retire', { kind: 'directive_report', id: reportId }, { note });
     return this.report_(reportId);
   }

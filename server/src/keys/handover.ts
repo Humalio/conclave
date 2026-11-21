@@ -12,9 +12,9 @@ import { KeyError, SESSION_VAR_RE, type Credential, type Keys } from './keys.js'
 
 export const HANDOVER_TTL_MS = 24 * 60 * 60 * 1000;
 export type HandoverKind = 'rotate' | 'recruit';
-export type CancelReason = 'operator' | 'expired' | 'replaced' | 'revoked' | 'binding_changed' | 'not_on_pc' | 'folder_refused';
+export type CancelReason = 'operator' | 'expired' | 'replaced' | 'revoked' | 'binding_changed' | 'not_on_pc' | 'folder_refused' | 'team_ended';
 /** What the connector lists (GET /connector/v1/handovers): no secret, only the public id of a key being replaced. */
-export interface HandoverListing { id: string; kind: HandoverKind; description: string; agents: { agent_id: string; label: string; key_id: string | null }[]; expires_at: number }
+export interface HandoverListing { id: string; kind: HandoverKind; description: string; agents: { agent_id: string; label: string; key_id: string | null }[]; expires_at: number; no_click?: true }
 /** An open rotation as the key's page shows it. */
 export interface OpenHandover { id: string; pc: { id: string; name: string }; created_at: number; expires_at: number; picked_up: boolean }
 /** The body a rotation's request keeps: why, and who rotated (the actor of the key.rotate at confirm). */
@@ -176,7 +176,9 @@ export class Handovers {
       const description = r.handover === 'rotate'
         ? `New key for ${agents.map((a) => a.label).join(', ')} (rotation)`
         : `${agents.length} new ${agents.length === 1 ? 'agent' : 'agents'} for team ${team ?? 'unknown'}`;
-      return { id: r.id, kind: r.handover, description, agents, expires_at: r.expires_at };
+      // A recruit of a team the operator set to Automatic was allowed when the operator set it: the connector needs no click on the PC (standard level only).
+      const auto = r.handover === 'recruit' && !!r.team_id && (this.db.prepare('SELECT recruiting FROM teams WHERE id=?').get(r.team_id) as { recruiting: string } | undefined)?.recruiting === 'auto';
+      return { id: r.id, kind: r.handover, description, agents, expires_at: r.expires_at, ...(auto ? { no_click: true as const } : {}) };
     });
   }
   /** How many handovers wait for this app key (the check-in's `handovers`). */
@@ -192,7 +194,7 @@ export class Handovers {
     const agents = (this.db.prepare('SELECT agent_id FROM onboarding_slots WHERE request_id=?').all(id) as { agent_id: string }[]).map((s) => s.agent_id);
     if (r.handover === 'recruit') {
       if (!this.cancelRecruit) return false;
-      this.cancelRecruit(id, reason === 'expired' ? 'The PC did not pick the recruit up within 24 hours.' : 'The handover was cancelled.', actor);
+      this.cancelRecruit(id, reason === 'expired' ? 'The PC did not pick the recruit up within 24 hours.' : reason === 'team_ended' ? 'Recruiting ended for the team.' : 'The handover was cancelled.', actor);
     } else {
       tx(this.db, () => {
         this.db.prepare("UPDATE onboarding_slots SET status='closed', staged_key_id=NULL, staged_verifier=NULL WHERE request_id=?").run(id);

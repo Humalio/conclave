@@ -16,7 +16,7 @@ import { testConfig, adminLogin } from './hub.js';
 
 const sys = { kind: 'system' as const, id: null };
 let app: App, base = '', admin = { cookie: '', csrf: '' }, pcKey = '', pcId = '', n = 0;
-const KEY_RE = /ah_(ses|app|tok)_|cnv_enrol_/;
+const KEY_RE = /ah_(ses|app|tok)_|cnc-pair-/;
 
 const api = async (method: string, path: string, body?: unknown) => {
   const r = await fetch(`${base}/api${path}`, { method, headers: { 'content-type': 'application/json', cookie: admin.cookie, 'x-csrf-token': admin.csrf }, body: body === undefined ? undefined : JSON.stringify(body) });

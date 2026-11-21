@@ -382,7 +382,9 @@ export class Keys {
       return !!r?.v && safeEqualHex(r.v, this.verifier(secret));
     }
     const table = kind === 'set' ? 'setup_keys' : kind === 'brg' ? 'bridge_keys' : 'credentials';
-    const row = this.db.prepare(`SELECT verifier FROM ${table} WHERE key_id=?`).get(keyId) as { verifier: string } | undefined;
+    // A removed revoked key is still one the hub issued: its tombstone keeps the verifier (docs/operations.md).
+    const row = (this.db.prepare(`SELECT verifier FROM ${table} WHERE key_id=?`).get(keyId)
+      ?? (table === 'credentials' ? this.db.prepare('SELECT verifier FROM key_tombstones WHERE key_id=?').get(keyId) : undefined)) as { verifier: string } | undefined;
     return !!row && safeEqualHex(row.verifier, this.verifier(secret));
   }
 
@@ -399,6 +401,11 @@ export class Keys {
     if (!m) throw new KeyError('invalid', 'malformed key');
     const kind: KeyKind = m[1] === 'app' ? 'app_key' : 'session_key';
     const c = this.db.prepare('SELECT * FROM credentials WHERE key_id=?').get(m[2]!) as unknown as (Credential & { verifier: string }) | undefined;
+    if (!c) {
+      // A revoked key the Revoked keys rule removed is still refused as revoked, so its reuse raises the same alert.
+      const t = this.db.prepare('SELECT kind, verifier FROM key_tombstones WHERE key_id=?').get(m[2]!) as { kind: KeyKind; verifier: string } | undefined;
+      if (t && t.kind === kind && kind === expect && safeEqualHex(t.verifier, this.verifier(m[3]!))) throw new KeyError('revoked', 'key is revoked');
+    }
     if (!c || c.kind !== kind || kind !== expect || !safeEqualHex(c.verifier, this.verifier(m[3]!))) throw new KeyError('unknown', 'unknown key');
     const st = this.effectiveStatus(c);
     if (st !== 'active') throw new KeyError(st, `key is ${st}`);
@@ -418,7 +425,9 @@ export class Keys {
     // A key held by a leak rotation may have leaked: it comes back only as a new key (rotate) or not at all (revoke).
     if (status === 'active' && this.isHeld(c)) throw new KeyError('invalid_state', 'This key is held because it may have leaked, so it cannot be resumed. Rotate it again to send a new key, or revoke it.');
     tx(this.db, () => {
-      this.db.prepare('UPDATE credentials SET status=?, status_reason=?, revoked_at=? WHERE id=?').run(status, reason, status === 'revoked' ? Date.now() : null, id);
+      const at = Date.now();
+      // suspended_at dates the suspension (the opt-in Suspended keys rule counts from it); a revoke keeps it.
+      this.db.prepare("UPDATE credentials SET status=?, status_reason=?, revoked_at=?, suspended_at=CASE ? WHEN 'suspended' THEN ? WHEN 'active' THEN NULL ELSE suspended_at END WHERE id=?").run(status, reason, status === 'revoked' ? at : null, status, at, id);
       if (status !== 'active') this.revokeTokensFor(id, status);
       // An open key handover for it (keys/handover.ts) would hand a suspended or revoked key a new secret: it is cancelled.
       if (status !== 'active') this.handoverCancel?.(id, 'revoked', actor);

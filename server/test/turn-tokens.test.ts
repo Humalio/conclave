@@ -64,6 +64,7 @@ describe('a hand-opened chat or a woken run works with a turn token alone', () =
     expect(r.status).toBe(200);
     expect(r.body.token).toMatch(/^ah_tok_/);
     expect(r.body.agent_id).toBe(a.id);
+    expect(r.body.label, 'the agent\'s own label (a Codex commit\'s author), not its key\'s').toBe('turn worker');
     const who = await rpc(asToken(r.body.token), 'session_whoami');
     expect(who.status).toBe(200);
     expect(who.body.result.structuredContent.agent_id).toBe(a.id);

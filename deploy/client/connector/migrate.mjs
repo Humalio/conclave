@@ -506,6 +506,11 @@ export const defaultUserEnv = {
   unset(name) { if (WIN) spawnSync('reg', ['delete', 'HKCU\\Environment', '/v', name, '/f'], { encoding: 'utf8' }); },
 };
 
+/** True when the old setup's `hub-ca.pem` still holds the CA this move pinned (the key file has the move's section and its fingerprint matches). */
+function caFileIsPinned(home, data) {
+  try { const kf = readKeyFile(home); return !!(kf.ok && data?.hub_key && kf.data.hubs[data.hub_key] && new X509Certificate(readFileSync(join(home, 'hub-ca.pem'), 'utf8')).fingerprint256.replace(/:/g, '').toLowerCase() === kf.data.hubs[data.hub_key].ca_sha256); } catch { return false; }
+}
+
 /**
  * `conclave migrate --finish`: forgets the rollback copies. With `removeLegacyCa` it also removes NODE_EXTRA_CA_CERTS, but
  * only if its value is exactly the old setup's `hub-ca.pem` and that file still holds the CA this move pinned (the key
@@ -536,9 +541,7 @@ export function finish(home, { removeLegacyCa = false, userEnv = defaultUserEnv 
   else if (!removeLegacyCa) lines.push('NODE_EXTRA_CA_CERTS is set and was left; run with --remove-legacy-ca to remove it if setup wrote it');
   else if (pathKey(val) !== pathKey(caFile)) lines.push('NODE_EXTRA_CA_CERTS points to a file the old setup did not write, so it was left');
   else {
-    let own = false;
-    try { const kf = readKeyFile(home); own = kf.ok && data.hub_key && !!kf.data.hubs[data.hub_key] && new X509Certificate(readFileSync(caFile, 'utf8')).fingerprint256.replace(/:/g, '').toLowerCase() === kf.data.hubs[data.hub_key].ca_sha256; } catch { own = false; }
-    if (!own) lines.push('NODE_EXTRA_CA_CERTS was left: its file is not the CA this move pinned');
+    if (!caFileIsPinned(home, data)) lines.push('NODE_EXTRA_CA_CERTS was left: its file is not the CA this move pinned');
     else { userEnv.unset('NODE_EXTRA_CA_CERTS'); lines.push('removed NODE_EXTRA_CA_CERTS (it named the old setup\'s hub-ca.pem); open programs keep the old value until restarted'); }
   }
   return { ok: true, reason: null, lines };
@@ -552,17 +555,33 @@ export { hubKeyOf };
  * the rollback copies of a move that is not finished, or NODE_EXTRA_CA_CERTS still naming the old setup's `hub-ca.pem`. It
  * answers yes or no and never a path (the check-in carries only this flag). A user environment read that fails counts as no.
  */
-export function legacyLeftovers(home, userEnv = defaultUserEnv) {
+export function legacyLeftovers(home, userEnv = defaultUserEnv) { return legacyLeftoverKinds(home, userEnv).length > 0; }
+
+/** The kinds `legacyLeftoverKinds` names: fixed words, so the hub and the console can say what to clean without a path. */
+export const LEFTOVER_KINDS = ['unfinished_move', 'ca_setting', 'old_keys', 'bridge_pieces'];
+const OLD_BRIDGE_PIECES = ['setup.mjs', 'agent-hub-headers.mjs', 'agent-hub-headers.py', 'codex-bridge.mjs', 'codex-wake.mjs', 'codex.mjs', 'codex-wake.json', 'agent-hub-bridge.mjs'];
+
+/**
+ * Which kinds of the old setup this PC still holds, in the order of `LEFTOVER_KINDS` (empty: none): an unfinished move (rollback
+ * copies, or an interrupted move), the old CA setting, the old setup's key file, the old bridge and helper files. Never a path.
+ */
+export function legacyLeftoverKinds(home, userEnv = defaultUserEnv) {
+  const kinds = [];
   const data = readJson(stateFile(home), null);
-  if (data && (data.status === 'applied' || data.status === 'applying')) return true;
-  try { const v = userEnv.get('NODE_EXTRA_CA_CERTS'); if (v && pathKey(v) === pathKey(join(home, 'hub-ca.pem'))) return true; } catch { /* unreadable: not reported */ }
-  return false;
+  if (data && (data.status === 'applied' || data.status === 'applying')) kinds.push('unfinished_move');
+  // Only a setting that `--finish --remove-legacy-ca` would really clear counts: a variable naming a file that is not the CA this move pinned is left alone by it, so reporting it would repeat for ever.
+  try { const v = userEnv.get('NODE_EXTRA_CA_CERTS'); if (v && pathKey(v) === pathKey(join(home, 'hub-ca.pem')) && caFileIsPinned(home, data)) kinds.push('ca_setting'); } catch { /* unreadable: not reported */ }
+  if (existsSync(join(home, 'keys.env'))) kinds.push('old_keys');
+  if (OLD_BRIDGE_PIECES.some((f) => existsSync(join(home, f)))) kinds.push('bridge_pieces');
+  return kinds;
 }
 
 /** What `conclave check` says about the leftovers, in plain words, or null when there are none. It only offers the command; it never runs it. */
 export function leftoversOffer(home, userEnv = defaultUserEnv) {
-  if (!legacyLeftovers(home, userEnv)) return null;
+  const kinds = legacyLeftoverKinds(home, userEnv);
+  if (!kinds.length) return null;
   const data = readJson(stateFile(home), null);
+  if (!kinds.includes('unfinished_move') && !kinds.includes('ca_setting')) return 'The old setup\'s files (its key file or its bridge and helper files) are still in the connector folder. `conclave migrate` lists what moving to the connector would change; Conclave never runs it for you.';
   if (data?.status === 'applying') return 'A move to the connector on this PC was interrupted. Run `conclave migrate --apply` again to complete it, or `conclave migrate --rollback` to undo it. Afterwards `conclave migrate --finish --remove-legacy-ca` clears the old setup\'s leftovers; Conclave never runs it for you.';
   return data?.status === 'applied'
     ? 'This PC still keeps the old setup\'s rollback copies, and may still set the old CA environment variable (NODE_EXTRA_CA_CERTS). Once everything has worked for a while, `conclave migrate --finish --remove-legacy-ca` deletes the copies (you can no longer undo the move) and removes that variable if the old setup wrote it. Conclave never runs it for you.'

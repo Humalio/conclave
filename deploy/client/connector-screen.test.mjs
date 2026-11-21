@@ -13,8 +13,9 @@ import { pendingList, requestFolder, requestPickup, approveFolder, approvePickup
 import { bindFolder, resolveFolder } from './connector/registry.mjs';
 import { startBroker, askBroker } from './connector/broker.mjs';
 import { line as reasonLine, REASONS } from './connector/reasons.mjs';
-import { startScreen, ago, teamCounts, needsHtml } from './connector/screen.mjs';
+import { startScreen, ago, teamCounts, needsHtml, statusHtml } from './connector/screen.mjs';
 import { canonicalFolder, folderIdentity } from './connector/paths.mjs';
+import { writeMarker } from './connector/isolation.mjs';
 
 process.env.CONCLAVE_KEY_STORE = 'file';
 const tmp = [];
@@ -160,6 +161,14 @@ describe('the screen', () => {
       for (const name of ['Wake', 'Isolation', 'Account profiles', 'Restore folders', 'Pair with another hub']) assert.ok(page.includes(`<b>${name}</b>`), name);
       assert.doesNotMatch(page, /Allow all/i);
     } finally { s.close(); await s.closed; }
+  });
+  test('the status line says the level the PC is at: Standard, and Hardened once the marker is written', () => {
+    const home = mk();
+    assert.match(statusHtml(home, [], new Map(), 3_600_000), /Standard isolation/);
+    writeMarker(home, { address: 'pipe-or-socket', view: 'view', vault: null });
+    const html = statusHtml(home, [], new Map(), 3_600_000);
+    assert.match(html, /Hardened isolation/);
+    assert.doesNotMatch(html, /Standard/);
   });
   test('Needs you: each row has the full path, the program, how long ago, Deny and Allow; there is no Allow all', async () => {
     const home = mk();

@@ -9,11 +9,14 @@
  * - **Shape:** the full structure with at most four separator characters between the parts. Words are never
  *   32 letters long, so "Utah application" is not a key. A shape that does not verify is reported as not issued.
  *
+ * A PC pairing code (`cnc-pair-` and 26 characters, docs/onboarding.md#the-code) is found the same way: it verifies against
+ * the hub's own codes, used or not, and is treated like a key.
+ *
  * Callers treat an issued hit as an incident (reject, suspend, withhold). A key-shaped string the hub never issued
  * is at most a warning: it cannot unlock anything here.
  */
 
-export type KeyKind = 'app' | 'ses' | 'set' | 'brg' | 'dsc' | 'tok' | 'rly';
+export type KeyKind = 'app' | 'ses' | 'set' | 'brg' | 'dsc' | 'tok' | 'rly' | 'pair';
 
 export interface LeakHit {
   field: string;
@@ -23,15 +26,16 @@ export interface LeakHit {
 }
 
 export interface LeakGuardOptions {
-  /** Exact check against the stored verifiers. For 'tok', keyId is '' and secret is the 40 characters after ah_tok_. */
+  /** Exact check against the stored verifiers. For 'tok', keyId is '' and secret is the 40 characters after ah_tok_; for 'pair', the 26 after cnc-pair-. */
   isIssued: (kind: KeyKind, keyId: string, secret: string) => boolean;
 }
 
 const SEP = '[\\s_\\-.:|/\\\\]{0,4}';
 /** The full key structure, case-insensitive, with optional separators between the parts. */
-const SHAPE = new RegExp(`ah${SEP}(?:app|ses|set|brg|dsc|rly)${SEP}[a-z2-7]{12}${SEP}[a-z2-7]{32}|ah${SEP}tok${SEP}[a-z2-7]{40}`, 'i');
+const SHAPE = new RegExp(`ah${SEP}(?:app|ses|set|brg|dsc|rly)${SEP}[a-z2-7]{12}${SEP}[a-z2-7]{32}|ah${SEP}tok${SEP}[a-z2-7]{40}|cnc${SEP}pair${SEP}[a-z2-7]{26}`, 'i');
 const PREFIX = /ah(app|ses|set|brg|dsc|rly|tok)/g;
-const B32_44 = /^[a-z2-7]{44}$/, B32_40 = /^[a-z2-7]{40}$/;
+const PAIR = /cncpair/g;
+const B32_44 = /^[a-z2-7]{44}$/, B32_40 = /^[a-z2-7]{40}$/, B32_26 = /^[a-z2-7]{26}$/;
 
 const INVISIBLE = /[​-‏⁠-⁤﻿­]/g;
 
@@ -105,6 +109,10 @@ export class LeakGuard {
         if (B32_44.test(rest) && this.opts.isIssued(k, rest.slice(0, 12), rest.slice(12))) return true;
       }
     }
+    for (const m of compact.matchAll(PAIR)) {
+      const secret = compact.slice(m.index! + 7, m.index! + 33);
+      if (B32_26.test(secret) && this.opts.isIssued('pair', '', secret)) return true;
+    }
     return false;
   }
 }
@@ -116,7 +124,7 @@ export class LeakGuard {
  */
 function decodeCandidates(s: string): string[] {
   const out: string[] = [];
-  const keep = (b: Buffer) => { const t = b.toString('latin1').replace(/[^\x20-\x7e]+/g, ' '); if (/ah/i.test(t)) out.push(t); };
+  const keep = (b: Buffer) => { const t = b.toString('latin1').replace(/[^\x20-\x7e]+/g, ' '); if (/ah|cnc/i.test(t)) out.push(t); };
   for (const m of s.matchAll(/[A-Za-z0-9+/_-]{20,}={0,2}/g)) {
     const run = m[0].replace(/-/g, '+').replace(/_/g, '/');
     for (let o = 0; o < 4 && run.length - o >= 20; o++) keep(Buffer.from(run.slice(o), 'base64'));

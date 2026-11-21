@@ -18,6 +18,7 @@ import { putHub, putAgentKey, caFingerprint } from './connector/keyfile.mjs';
 import { registerFolder, repairFolder } from './connector/register.mjs';
 import { resolveFolder } from './connector/registry.mjs';
 import { runCheck } from './connector/check.mjs';
+import { codexToolsState } from './connector/codextools.mjs';
 import { canonicalFolder, WIN } from './connector/paths.mjs';
 import { line } from './connector/reasons.mjs';
 import { commitAuthor } from './connector/mcpserver.mjs';
@@ -137,6 +138,31 @@ describe('commitFiles in the agent\'s own clone', gitOpts, () => {
     assert.equal(r.ok, true, r.reason);
     assert.equal(existsSync(marker), false, 'no hook ran during the commit or the branch switch');
     assert.deepEqual(readdirSync(join(c.home, 'no-hooks')), [], 'the connector\'s hooks folder is empty');
+  });
+  test('inherited GIT_* variables, the repo\'s fsmonitor and signing never reach the commit; GIT~1 is refused', () => {
+    const c = clone();
+    const other = join(c.base, 'other'); mkdirSync(other); G(other, 'init', '-q', '-b', 'main');
+    const marker = join(c.base, 'ran').replace(/\\/g, '/');
+    const script = (name) => { const p = join(c.base, name); writeFileSync(p, `#!/bin/sh\necho ${name} >> "${marker}"\nexit 1\n`, { mode: 0o755 }); return p.replace(/\\/g, '/'); };
+    G(c.folder, 'config', 'core.fsmonitor', script('fsmonitor'));
+    G(c.folder, 'config', 'commit.gpgsign', 'true');
+    G(c.folder, 'config', 'gpg.program', script('gpg'));
+    const saved = {};
+    const inherit = { GIT_DIR: join(other, '.git'), GIT_WORK_TREE: other, GIT_INDEX_FILE: join(c.base, 'stray-index'), GIT_AUTHOR_NAME: 'PC User', GIT_AUTHOR_EMAIL: 'pc-user@example.org', GIT_COMMITTER_NAME: 'PC User', GIT_CONFIG_PARAMETERS: "'core.hookspath=/nowhere'" };
+    for (const [k, v] of Object.entries(inherit)) { saved[k] = process.env[k]; process.env[k] = v; }
+    let r, alias;
+    try {
+      writeFileSync(join(c.folder, 'a.txt'), 'two\n');
+      alias = commit(c, { paths: ['GIT~1/config'], branch: 'dev/env' });
+      r = commit(c, { paths: ['a.txt'], branch: 'dev/env' });
+    } finally { for (const k of Object.keys(inherit)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } }
+    assert.equal(alias.ok, false);
+    assert.match(alias.reason, /nothing in \.git/);
+    assert.equal(r.ok, true, r.reason);
+    assert.equal(G(c.folder, 'log', '-1', '--format=%an <%ae>|%G?'), `${AUTHOR.name} <${AUTHOR.email}>|N`, 'the agent is the author, and the commit is not signed');
+    assert.equal(G(c.folder, 'show', '--name-only', '--format=', 'HEAD'), 'a.txt', 'committed in the agent\'s clone');
+    assert.equal(spawnSync('git', ['-C', other, 'rev-parse', '--verify', '-q', 'HEAD']).status === 0, false, 'nothing landed in the repo GIT_DIR named');
+    assert.equal(existsSync(marker), false, 'neither the fsmonitor nor the signing program ran');
   });
   test('refused before git runs: .git, .codex, the role file, paths outside the clone, a folder, an unknown file', () => {
     const c = clone();
@@ -258,7 +284,7 @@ describe('the role file: marked, checked and put back', gitOpts, () => {
   test('check reports a role file that is missing, edited or unmarked; repair writes the hub text back, never over an unmarked one', async () => {
     const s = connectorHome(pki, 'https://127.0.0.1:9');
     assert.equal(resolveFolder(s.home, s.folder).binding.provider, 'codex');
-    const check = () => runCheck(s.home, s.folder, { claudeJson: s.claudeJson, win: WIN });
+    const check = () => runCheck(s.home, s.folder, { claudeJson: s.claudeJson, win: WIN, codex: { program: null } });
     assert.equal((await check()).reason, 'role_file_missing');
     writeOverride(s.home, s.folder, 'Hub playbook.', s.cx);
     const good = readFileSync(join(s.folder, 'AGENTS.override.md'), 'utf8');
@@ -307,7 +333,7 @@ function stubHub(pki) {
         return res.end(JSON.stringify({ token: 'tok-1', agent_id: 'agent-dev4', label: 'Conclave · Developer 4', expires_at: Date.now() + 900_000 }));
       }
       hub.requests.push(tool);
-      const ok = (result) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result })); };
+      const ok = (result) => { res.writeHead(200, { 'content-type': 'application/json', ...(hub.digest ? { 'x-agent-hub-tools': hub.digest } : {}) }); res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result })); };
       if (req.headers['x-agent-hub-session'] !== 'tok-1') { res.writeHead(401); return res.end('{}'); }
       if (tool === 'initialize') return ok({ protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'stub', version: '0' } });
       if (tool === 'tools/list') return ok({ tools: [{ name: 'task_list', inputSchema: { type: 'object' } }] });
@@ -327,9 +353,115 @@ function mcp(s, msgs) {
     c.stdin.end();
   });
 }
+/** The same, one message at a time: each waits for the answer to the one before; before(i) runs ahead of message i. */
+function mcpSteps(s, msgs, before = () => {}) {
+  return new Promise((resolve) => {
+    const c = spawn(process.execPath, [CLI, 'mcp', s.folder], { env: { ...process.env, CONCLAVE_HOME: s.home }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const got = []; let buf = '', i = 0;
+    const next = () => { if (i >= msgs.length) return c.stdin.end(); before(i); c.stdin.write(JSON.stringify(msgs[i++]) + '\n'); };
+    c.stdout.on('data', (d) => {
+      buf += d; let n;
+      while ((n = buf.indexOf('\n')) >= 0) { const l = buf.slice(0, n); buf = buf.slice(n + 1); if (!l.trim()) continue; const m = JSON.parse(l); got.push(m); if (m.id === msgs[i - 1]?.id) next(); }
+    });
+    c.on('close', () => resolve(got));
+    next();
+  });
+}
 const INIT = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'codex-mcp-client', version: '0' } } };
 const LIST = { jsonrpc: '2.0', id: 2, method: 'tools/list' };
 const call = (id, name, args) => ({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } });
+
+describe('conclave mcp tells the client when its tool list changed', { ...gitOpts, concurrency: false }, () => {
+  let pki;
+  before(() => { pki = testCa('Tool list CA'); });
+  test('an answer whose tools digest differs from the last tools/list sends list_changed once, after that answer', async () => {
+    const hub = await stubHub(pki);
+    try {
+      const s = connectorHome(pki, hub.origin, { provider: 'claude_code' });
+      hub.digest = 'aaaa';
+      const msgs = [INIT, LIST, call(3, 'task_list', {}), call(4, 'task_list', {}), call(5, 'task_list', {}), { ...LIST, id: 6 }, call(7, 'task_list', {})];
+      const out = await withConnector(s, () => mcpSteps(s, msgs, (i) => { if (i === 3) hub.digest = 'bbbb'; }));
+      const seq = out.map((m) => m.method ?? m.id);
+      assert.deepEqual(seq, [1, 2, 3, 4, 'notifications/tools/list_changed', 5, 6, 7], 'told once, right after the first answer with the new digest');
+      assert.match(readFileSync(join(s.home, 'connector.log'), 'utf8'), /mcp tools changed folder=/);
+    } finally { await hub.close(); }
+  });
+  test('a hub that sends no digest never triggers it', async () => {
+    const hub = await stubHub(pki);
+    try {
+      const s = connectorHome(pki, hub.origin, { provider: 'claude_code' });
+      const out = await withConnector(s, () => mcpSteps(s, [INIT, LIST, call(3, 'task_list', {})]));
+      assert.deepEqual(out.map((m) => m.method ?? m.id), [1, 2, 3]);
+    } finally { await hub.close(); }
+  });
+});
+
+describe('a Codex that cannot run tools', gitOpts, () => {
+  const FEATURES = (on) => `code_mode                                under development  false\ncode_mode_host                           stable             ${on}\ncode_mode_interrupt                      stable             true\n`;
+  const answers = (stdout, status = 0) => { const calls = []; return { calls, run: (file, args, o) => { calls.push({ file, args, cwd: o.cwd }); return { status, stdout }; } }; };
+  const NATIVE = { file: join(tmpdir(), 'cx', 'codex.exe'), prefix: [] };
+  test('a native Codex with the host feature on and no host beside it is broken; with the host it is fine', () => {
+    const a = answers(FEATURES(true));
+    assert.equal(codexToolsState({ program: NATIVE, run: a.run, exists: () => false, win: true }).state, 'broken');
+    assert.deepEqual(a.calls[0].args, ['features', 'list'], 'asks the program itself, nothing else');
+    let looked = null;
+    assert.equal(codexToolsState({ program: NATIVE, run: a.run, exists: (p) => { looked = p; return true; }, win: true }).state, 'ok');
+    assert.equal(looked, join(dirname(NATIVE.file), 'codex-code-mode-host.exe'));
+  });
+  test('an npm install is looked for in its package\'s vendor folder; with no vendor folder it is not checked', () => {
+    const base = mkdtempSync(join(tmpdir(), 'cx-npm-'));
+    const script = join(base, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+    mkdirSync(dirname(script), { recursive: true }); writeFileSync(script, '');
+    const prog = { file: process.execPath, prefix: [script] };
+    const a = answers(FEATURES(true));
+    assert.equal(codexToolsState({ program: prog, run: a.run, win: true }).state, 'unknown', 'no vendor folder at all: a step, not a failure');
+    assert.deepEqual(a.calls[0].args, [script, 'features', 'list']);
+    mkdirSync(join(base, 'node_modules', '@openai', 'codex', 'vendor'), { recursive: true });
+    assert.equal(codexToolsState({ program: prog, run: a.run, win: true }).state, 'broken', 'a vendor folder without the host');
+    const host = join(base, 'node_modules', '@openai', 'codex', 'vendor', 'x86_64-pc-windows-msvc', 'codex', 'codex-code-mode-host.exe');
+    mkdirSync(dirname(host), { recursive: true }); writeFileSync(host, '');
+    assert.equal(codexToolsState({ program: prog, run: a.run, win: true }).state, 'ok');
+  });
+  for (const [where, at] of [['nested in the package', ['codex', 'node_modules', '@openai']], ['beside the package', []]]) {
+    test(`an npm install finds the host in a platform package ${where}`, () => {
+      const base = mkdtempSync(join(tmpdir(), 'cx-npm-'));
+      const script = join(base, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+      mkdirSync(dirname(script), { recursive: true }); writeFileSync(script, '');
+      const prog = { file: process.execPath, prefix: [script] };
+      const vendor = join(base, 'node_modules', '@openai', ...at, 'codex-win32-x64', 'vendor');
+      mkdirSync(vendor, { recursive: true });
+      const a = answers(FEATURES(true));
+      assert.equal(codexToolsState({ program: prog, run: a.run, win: true }).state, 'broken', 'its vendor folder without the host');
+      const host = join(vendor, 'x86_64-pc-windows-msvc', 'codex', 'codex-code-mode-host.exe');
+      mkdirSync(dirname(host), { recursive: true }); writeFileSync(host, '');
+      assert.equal(codexToolsState({ program: prog, run: a.run, win: true }).state, 'ok');
+    });
+  }
+  test('never a failure when it cannot tell: feature off or absent, no answer, or no Codex found', () => {
+    assert.equal(codexToolsState({ program: NATIVE, run: answers(FEATURES(false)).run, exists: () => false }).state, 'ok');
+    assert.equal(codexToolsState({ program: NATIVE, run: answers('code_mode stable true\n').run, exists: () => false }).state, 'ok', 'an older Codex without the feature');
+    assert.equal(codexToolsState({ program: NATIVE, run: answers('', 1).run, exists: () => false }).state, 'unknown');
+    assert.equal(codexToolsState({ program: NATIVE, run: () => ({ error: new Error('ENOENT') }), exists: () => false }).state, 'unknown');
+    assert.equal(codexToolsState({ program: null }).state, 'not_found');
+  });
+  test('conclave check stops with one plain line that says to reinstall Codex; a Claude Code folder is never asked', async () => {
+    const pki = testCa('Codex tools CA');
+    const s = connectorHome(pki, 'https://127.0.0.1:9');
+    writeOverride(s.home, s.folder, 'Hub playbook.', s.cx);
+    const broken = { program: NATIVE, run: answers(FEATURES(true)).run, exists: () => false, win: true };
+    const r = await runCheck(s.home, s.folder, { claudeJson: s.claudeJson, win: WIN, codex: broken });
+    assert.equal(r.reason, 'codex_tools_broken');
+    assert.equal(r.line, line('codex_tools_broken'));
+    assert.match(r.line, /^Codex on this PC cannot run any tool: its code-mode host program is missing, so every tool call fails\. Reinstall Codex, then check again\. Run: conclave check \(in this folder\)$/);
+    const fine = await runCheck(s.home, s.folder, { claudeJson: s.claudeJson, win: WIN, codex: { ...broken, exists: () => true } });
+    assert.equal(fine.ok, true, fine.line);
+    assert.ok(fine.steps.some((x) => /Codex can run tools/.test(x.step)));
+    const cc = connectorHome(pki, 'https://127.0.0.1:9', { provider: 'claude_code' });
+    let asked = false;
+    assert.equal((await runCheck(cc.home, cc.folder, { claudeJson: cc.claudeJson, win: WIN, codex: { ...broken, run: () => { asked = true; return { status: 0, stdout: FEATURES(true) }; } } })).ok, true);
+    assert.equal(asked, false);
+  });
+});
 
 describe('conclave mcp in a Codex folder', { ...gitOpts, concurrency: false }, () => {
   let pki;

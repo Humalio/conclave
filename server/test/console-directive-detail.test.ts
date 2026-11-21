@@ -415,3 +415,12 @@ describe('directive agent list', () => {
     expect(css).not.toMatch(/\.dag-chips|\.dag-flt|\.dag-cnt/);
   });
 });
+
+describe('the directive edit sheet', () => {
+  it('offers a minor edit when editing, sends minor: true, and refuses it with a scope change', () => {
+    const sheet = js.slice(js.indexOf('async function dirSheet('), js.indexOf('async function dirSheet(') + 8000);
+    expect(sheet).toContain(`<input type="checkbox" id="dsMinor"> Minor edit, don't ask agents to re-read`);
+    expect(sheet).toContain("...(minor ? { minor: true } : {})");
+    expect(sheet).toContain('A minor edit cannot change what the directive applies to.');
+  });
+});

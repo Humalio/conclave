@@ -82,8 +82,9 @@ svg.i{width:var(--icon);height:var(--icon);fill:none;stroke:currentColor;stroke-
 @keyframes pulse{0%{transform:scale(1);opacity:.55}70%,100%{transform:scale(2.75);opacity:0}}
 .grow{flex:1}
 /* segmented control: 36 px, 2 px inset; equal widths on phones */
-.seg{display:flex;height:36px;padding:2px;background:var(--panel-2);border-radius:var(--r-md)}
-.seg button{flex:1 1 auto;display:inline-flex;align-items:center;justify-content:center;gap:var(--s2);padding:0 var(--s3);border-radius:var(--r-sm);color:var(--muted);font:var(--t-label);white-space:nowrap}
+.seg{display:flex;height:36px;padding:2px;background:var(--panel-2);border-radius:var(--r-md);max-width:100%;overflow-x:auto;scrollbar-width:none} /* a long row scrolls inside its own box; it never widens the page (and with it the fixed bars) */
+.seg::-webkit-scrollbar{display:none}
+.seg button{flex:1 0 auto;display:inline-flex;align-items:center;justify-content:center;gap:var(--s2);padding:0 var(--s3);border-radius:var(--r-sm);color:var(--muted);font:var(--t-label);white-space:nowrap}
 .seg button:hover{color:var(--text)}
 .seg button.on{background:var(--panel-3);color:var(--text)}
 /* button: 32 desktop, 36 phone, 44 in action bars; one primary per screen */
@@ -214,6 +215,8 @@ a.lrow:hover .chev,button.lrow:hover .chev,.lrow.act:hover .chev{color:var(--tex
 .alert.info .alert-ico{background:var(--info)}
 .alert-title{flex:1;min-width:0;font:var(--t-title);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .alert-msg{margin:0;font:var(--t-body);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+/* A banner whose whole text matters (a PC that just paired) wraps instead of being cut. */
+.alert.full .alert-msg,#ovAlert .alert.full .alert-msg{display:block;-webkit-line-clamp:unset;overflow:visible;overflow-wrap:anywhere}
 .alert-acts{display:flex;flex-wrap:wrap;gap:var(--s2)}
 .alert-acts .btn{flex:1}
 @media (min-width:768px){.alert-acts .btn{flex:none}}
@@ -457,6 +460,7 @@ button.info.end .info-tip{left:auto;right:0}
   #ovAlert .alert-hd{flex:none;max-width:40%}
   #ovAlert .alert-title{flex:none}
   #ovAlert .alert-msg{flex:1;min-width:0;-webkit-line-clamp:1}
+  #ovAlert .alert.full .alert-hd{max-width:none}
   #ovAlert .alert-acts{flex:none;flex-wrap:nowrap}
 }
 /* key figures: the stats grid on phones; from 768 px a half-height strip (about 48 px) of seven equal cells, each one baseline line:
@@ -1639,6 +1643,10 @@ button.av{cursor:pointer}
 @media (min-width:768px){.kd-card{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--card-pad);min-width:0}}
 @media (min-width:1180px){.kd-grid{display:grid;grid-template-columns:minmax(0,7fr) minmax(0,5fr);align-items:start}}
 .kd-card.kvc{padding-top:var(--s3)}
+.kd-more>summary{display:flex;align-items:center;gap:var(--s2);height:var(--h-touch);border-top:1px solid var(--line);font:var(--t-title);color:var(--accent);cursor:pointer;list-style:none}
+.kd-more>summary::-webkit-details-marker{display:none}
+.kd-more>summary::before{content:"";border:solid currentColor;border-width:0 2px 2px 0;width:6px;height:6px;transform:rotate(-45deg);transition:transform .15s}
+.kd-more[open]>summary::before{transform:rotate(45deg)}
 .kd-h{display:flex;align-items:center;gap:var(--s2);min-height:var(--h-ctl);margin-bottom:var(--s1)}
 .kd-h h3{flex:1;min-width:0;margin:0;font:var(--t-title);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .kd-h+.kv,.kd-h+.lrow,.kd-h+.more-box>.lrow:first-child{border-top:0}
@@ -1793,6 +1801,9 @@ button.av{cursor:pointer}
 @media (max-width:767.98px){
   .tw-row:has(.seg),.tw-row:has(.tw-recf){flex-direction:column;align-items:stretch}
   .tw-row .seg button{flex:1}
+  /* The task tags row: the label, the tag list and Edit tags do not fit on one line; the list takes its own line and wraps */
+  .tw-row:has(.tw-tags){flex-wrap:wrap}
+  .tw-row>.tw-tags{flex:1 1 100%;min-width:0;order:3}
   .tw-recf{justify-content:flex-start}
 }
 /* Task */
@@ -1829,6 +1840,14 @@ button.av{cursor:pointer}
 .lrow-lead .mono{color:var(--muted)}
 .lrow .switch::before{content:"";position:absolute;inset:calc((var(--h-touch) - var(--s6)) / -2) calc(var(--s2) * -1)} /* 44 px tap target around the 24 px track */
 .sheet-acts{display:flex;gap:var(--s2);margin-top:var(--s3)}
+/* A form sheet taller than the room scrolls inside itself; its buttons stay pinned to the sheet's bottom edge. */
+.sheet-form>.sheet-acts{position:sticky;bottom:calc(-1 * (var(--s4) + env(safe-area-inset-bottom)));z-index:1;margin:0 0 calc(-1 * (var(--s4) + env(safe-area-inset-bottom)));padding:var(--s3) 0 calc(var(--s4) + env(safe-area-inset-bottom));background:var(--panel-3);border-top:1px solid var(--line)}
+/* Settings → Onboarding: titles and help lines wrap instead of being cut off. */
+.ob-set{display:contents}
+.ob-set .lrow{height:auto;min-height:56px}
+.ob-set :is(.lrow-title,.lrow-meta){white-space:normal}
+.ob-set .ob-act{padding:0 0 var(--s2)}
+#owSet .hint{margin-bottom:var(--s2)}
 .sheet-acts .btn{flex:1}
 /* The one-time view guard's confirm row at a sheet's foot (onceBlocked in app.js). */
 .once-q{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s2);margin-top:var(--s3);padding:var(--s3);border-radius:var(--r-lg);background:var(--bad-soft);border:1px solid color-mix(in srgb,var(--bad) 40%,transparent);font:var(--t-body)}
@@ -3648,3 +3667,39 @@ button.bp-sk-c:hover .stat-l{color:var(--text)}
 .bp-rf-r .chk-row{align-items:flex-start;color:inherit}
 .bp-rf-r .chk-row>span{display:grid;gap:2px;overflow-wrap:anywhere}
 .bp-rf-why,.bp-rf-need{display:block}
+
+/* Security → Database (docs/operations.md) */
+.dbh{display:flex;flex-direction:column;gap:var(--s3)}
+.dbh-line{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap;font:var(--t-body);margin-bottom:var(--s3)}
+.dbh-stats{--cols:4;margin-bottom:var(--s2)}
+.dbh-areas{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0 var(--s4)}
+.dbh-area{display:grid;grid-template-columns:1fr auto;column-gap:var(--s2);padding:var(--s2) 0;border-top:1px solid var(--line);font:var(--t-body)}
+.dbh-area b{font:var(--t-title);font-variant-numeric:tabular-nums;text-align:right}
+.dbh-cols{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:var(--s3);align-items:start}
+.dbh-side{display:flex;flex-direction:column;gap:var(--s3)}
+.dbh-days{display:inline-flex;align-items:center;gap:var(--s1)}
+.dbh .lrow-title .info{margin-left:var(--s1)}
+.dbh .lrow-trail{display:flex;align-items:center;gap:var(--s2)}
+@media (max-width:767px){.dbh-cols{grid-template-columns:minmax(0,1fr)}.dbh-stats{--cols:2}.dbh .lrow{flex-wrap:wrap;height:auto;min-height:56px;padding:var(--s2) 0}.dbh .lrow-main{flex-basis:200px}.dbh .lrow-trail{width:100%;justify-content:flex-end}}
+
+/* A design to decide (designOpen): the question's own screen, with its answers in a bar under the scrolling body. */
+.sheet.ds{display:flex;flex-direction:column;max-height:min(90vh,100dvh)}
+.ds-body{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:var(--s3);padding-bottom:var(--s3)}
+.ds-q{font:var(--t-head);margin:0}
+.ds-rec{margin:0;color:var(--accent)}.ds-rec svg{vertical-align:-2px;margin-right:var(--s1)}
+.ds-meta,.ds-rv{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s2)}
+.ds-body>*{flex:none}
+.ds-sec{display:flex;flex-direction:column;gap:var(--s2)}
+.ds-sec h3{margin:0}
+.ds-rvs{margin:0}
+.ds-ch{margin:0;padding-left:var(--s4)}
+.ds-done{margin:0;font-weight:600}
+.ds-mocks{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:var(--s2)}
+.ds-mock{margin:0}
+.ds-mock img{width:100%;height:auto;border:1px solid var(--line-2);border-radius:var(--r-chip);display:block;background:var(--panel-3)}
+.ds-mock figcaption{font:var(--t-meta);color:var(--muted);margin-top:var(--s1)}
+.ds-doc{border:1px solid var(--line-2);border-radius:var(--r-chip);padding:var(--s3)}
+.ds-bar{position:sticky;bottom:0;display:flex;flex-wrap:wrap;gap:var(--s2);padding:var(--s3) 0 0;border-top:1px solid var(--line-2);background:var(--panel)}
+.ds-note{padding-top:var(--s2);display:flex;flex-direction:column;gap:var(--s2)}
+.ds-keep{flex:1 0 100%;margin:0}
+@media (max-width:767px){.sheet.ds{height:100dvh;max-height:100dvh;border-radius:0}.ds-bar .btn{flex:1 0 100%}.ds-bar [data-ds=change],.ds-bar [data-ds=reject],.ds-bar [data-ds=overturn]{flex:1 0 40%}}

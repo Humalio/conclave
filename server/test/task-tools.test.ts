@@ -213,7 +213,7 @@ describe('relayed operator answers (docs/decisions.md#relayed-answers)', () => {
     const note = app.db.prepare("SELECT body FROM agent_notices WHERE agent_id=? AND kind='decision' ORDER BY seq DESC LIMIT 1").get(X.w1.id) as { body: string };
     expect(note.body).toMatch(/relayed an answer from the operator to question .* relayed \(L1\) until the operator confirms it\. Read it with team_decisions/);
     // The decision log shows it as relayed; the operator's own answer route refuses it (it is no longer open).
-    const log = await X.R('team_decisions', { team_id: X.tid });
+    const log = await X.R('team_decisions', { team_id: X.tid, status: 'all' });
     expect(log.structuredContent.decisions[0]).toMatchObject({ decision_id: id, trust: 'L1' });
     expect(log.content[0]!.text).toContain('relayed by');
     expect((await api('POST', `/decisions/${id}/answer`, { option: 'a' })).status).toBe(409);
@@ -234,7 +234,7 @@ describe('relayed operator answers (docs/decisions.md#relayed-answers)', () => {
     expect((await api('POST', `/decisions/${id}/overturn`, { option: 'a' })).status).toBe(409);
     const n = app.db.prepare("SELECT body FROM agent_notices WHERE agent_id=? AND kind='decision' ORDER BY seq DESC LIMIT 1").get(X.w1.id) as { body: string };
     expect(n.body).toContain('The operator confirmed the relayed answer');
-    expect((await X.R('team_decisions', { team_id: X.tid })).structuredContent.decisions[0]).toMatchObject({ trust: 'L0', relay: { state: 'confirmed' } });
+    expect((await X.R('team_decisions', { team_id: X.tid, decision_id: id })).structuredContent.decisions[0]).toMatchObject({ trust: 'L0', relay: { state: 'confirmed' } });
   });
 
   it('the operator overturns it: the operator\'s answer replaces it, the relayed one stays on record, the task is not blocked again', async () => {

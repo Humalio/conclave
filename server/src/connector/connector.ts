@@ -33,8 +33,13 @@ export const pcProfileOf = (a: { profile?: unknown; profile_hidden?: unknown } |
 /** At most this many versions wait for approval because PCs reported them. */
 export const MAX_PENDING_REPORTED = 5;
 export const ACTION_KINDS = ['check', 'restore', 'update'] as const;
-/** Notices that need a turn of their agent: only these make a delivery order. A directive change or a pause is shown at the next turn and starts none. */
-export const TURN_NOTICES = new Set(['task_assigned', 'changes_requested', 'review_requested', 'decision', 'task_accepted', 'team_resumed', 'plan_request', 'task_approved', 'task_blocked', 'decision_asked']);
+/**
+ * Notices that need a turn of their agent: only these make a delivery order. Everything else is shown at the next turn and
+ * starts none: a directive change, a pause, a question asked or answered that the coordinator only hears about
+ * (`decision_asked`, `decision_update`), a task waiting for the administrator's approval (`task_awaiting_approval`), and a
+ * resume for a member with no live task (`team_resumed_note`).
+ */
+export const TURN_NOTICES = new Set(['task_assigned', 'changes_requested', 'review_requested', 'decision', 'task_accepted', 'team_resumed', 'plan_request', 'task_approved', 'task_blocked']);
 /** A fetched order is handed out again when its last hand-out is this old and no result has come. */
 export const REHAND_MS = 2 * 60_000;
 /** What a delivery order's result may say when no turn started. */
@@ -114,16 +119,19 @@ export interface CheckIn {
   destinations?: { id: string; label: string }[];
   /** True while the PC still holds pieces of the old setup (rollback copies, the old CA setting). A flag only: no path, no name. */
   legacy_leftovers?: boolean | null;
+  /** Which kinds: fixed words, in `LEFTOVER_KIND_WORDS`. */
+  legacy_leftover_kinds?: string[] | null;
   /** How full each agent's context is (design 3c), sent only while the PC's user opted in to usage reports. */
   context?: ContextReport[];
 }
 export const ISOLATION = ['standard', 'hardened'] as const;
+export const LEFTOVER_KIND_WORDS = ['unfinished_move', 'ca_setting', 'old_keys', 'bridge_pieces'] as const;
 export const KEY_STORES = ['dpapi', 'keychain', 'secret_service', 'file', 'service'] as const;
 export const DESTINATION_RE = /^dst_[a-z0-9]{6,32}$/;
 interface ReportRow {
   machine_id: string; version: string | null; platform: string | null; node: string | null; git: string | null; clients: string;
   auto_update: number | null; remote_cleanup: number | null; remove_with_last_hub: number | null; usage_opt_in: number | null; hardware_opt_in: number | null;
-  agents: string; destinations: string | null; isolation: string | null; key_store: string | null; legacy_leftovers: number | null; first_check_in_at: number; last_check_in_at: number;
+  agents: string; destinations: string | null; isolation: string | null; key_store: string | null; legacy_leftovers: number | null; legacy_leftover_kinds: string | null; first_check_in_at: number; last_check_in_at: number;
 }
 interface ActionRow {
   id: string; machine_id: string; kind: string; state: string; payload: string; result: string | null; created_at: number; created_by: string | null;
@@ -207,6 +215,7 @@ export class Connector {
       // The app key it checked in with is the one a key handover for this PC is bound to (a bridge key leaves it as it was).
       if (had) this.db.prepare('UPDATE connector_reports SET version=?,platform=?,node=?,git=?,clients=?,auto_update=?,remote_cleanup=?,remove_with_last_hub=?,usage_opt_in=?,hardware_opt_in=?,agents=?,destinations=?,isolation=?,key_store=?,legacy_leftovers=?,last_check_in_at=?,app_credential_id=COALESCE(?, app_credential_id) WHERE machine_id=?').run(...vals, now, appCredentialId, machineId);
       else this.db.prepare('INSERT INTO connector_reports(version,platform,node,git,clients,auto_update,remote_cleanup,remove_with_last_hub,usage_opt_in,hardware_opt_in,agents,destinations,isolation,key_store,legacy_leftovers,first_check_in_at,last_check_in_at,app_credential_id,machine_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(...vals, now, now, appCredentialId, machineId);
+      this.db.prepare('UPDATE connector_reports SET legacy_leftover_kinds=? WHERE machine_id=?').run(r.legacy_leftover_kinds === undefined || r.legacy_leftover_kinds === null ? null : JSON.stringify(r.legacy_leftover_kinds), machineId);
       if (this.noteReported(r.version, machineId)) this.audit.alert('info', 'connector_version_pending', r.version, { version: r.version, pc: machineId });
       // Context numbers only under the usage opt-in, and only for this PC's own agents; with the opt-in off nothing is kept from this report.
       if (r.usage_opt_in === true) for (const c of (r.context ?? []).filter((x) => own.has(x.agent_id))) this.putContext(machineId, c, now);
@@ -308,7 +317,7 @@ export class Connector {
     if (!app) throw fail('forbidden', 'This PC has no active app key.');
     const { token, credential } = this.keys.login(app, sessionKey, { turn: { runRef } });
     this.audit.event({ kind: 'system', id: null }, 'connector.turn_token', { kind: 'agent', id: credential.agent_id! }, { pc: machineId, run: runRef });
-    return { token, agent_id: credential.agent_id!, label: credential.label ?? null, expires_at: Date.now() + 15 * 60_000 };
+    return { token, agent_id: credential.agent_id!, label: this.keys.agent(credential.agent_id!)?.label ?? null, expires_at: Date.now() + 15 * 60_000 };
   }
   /** Set in app.ts: why an agent's run may not keep its turn token (its team is paused, or a lockdown holds it or its PC), or null. */
   turnHold: ((agentId: string, machineId: string) => { code: 'paused' | 'lockdown'; message: string } | null) | null = null;
@@ -371,19 +380,22 @@ export class Connector {
   /**
    * The folders the connector registered for this PC's agents (docs/connector.md, "Folders"): each becomes a proposed `machine_folders`
    * row, the same row and the same operator approval as setup_pc's, so a transfer into the PC still needs an approved one. A path is
-   * refused when it names no agent of this PC (by label, among the agents whose session key is bound to it), is not one absolute path,
+   * refused when it names no agent of this PC (by id, then label, then folder slug, among the agents whose session key is bound to it), is not one absolute path,
    * or is a root or a top-level folder: an agent's folder is never that wide. A row that exists is left as it is (an approved or a
    * rejected one keeps its decision), and a PC holds at most MAX_PC_FOLDERS rows.
    */
-  proposeFolders(machineId: string, entries: { agent: string; path: string }[]) {
+  proposeFolders(machineId: string, entries: { agent: string; agent_id?: string; path: string }[]) {
     const own = this.ownAgents(machineId);
-    const labels = new Set<string>();
-    for (const id of own) { const a = this.db.prepare('SELECT label FROM agents WHERE id=?').get(id) as { label: string } | undefined; if (a) labels.add(a.label); }
+    const rows: { id: string; label: string }[] = [];
+    for (const id of own) { const a = this.db.prepare('SELECT label FROM agents WHERE id=?').get(id) as { label: string } | undefined; if (a) rows.push({ id, label: a.label }); }
+    // The agent id is exact. The connector's name for an agent is its folder slug (the label lower-cased, with dashes), so a name also matches a label or, when only one agent of this PC has it, a slug.
+    const slugOf = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    const isOwn = (e: { agent: string; agent_id?: string }) => (e.agent_id !== undefined && own.has(e.agent_id)) || rows.some((r) => r.label === e.agent) || rows.filter((r) => slugOf(r.label) === e.agent).length === 1;
     const now = this.now(), refused: { path: string; reason: string }[] = [];
     let proposed = 0, known = 0;
     tx(this.db, () => {
       for (const e of entries) {
-        const why = !labels.has(e.agent) ? 'unknown_agent' : folderRefusal(e.path);
+        const why = !isOwn(e) ? 'unknown_agent' : folderRefusal(e.path);
         if (why) { refused.push({ path: e.path.slice(0, 200), reason: why }); continue; }
         if (this.db.prepare('SELECT 1 FROM machine_folders WHERE machine_id=? AND path=?').get(machineId, e.path)) { known++; continue; }
         const n = (this.db.prepare('SELECT COUNT(*) n FROM machine_folders WHERE machine_id=?').get(machineId) as { n: number }).n;
@@ -535,7 +547,7 @@ export class Connector {
     const held = this.disconnected(machineId) ? 'disconnected' as const : this.keys.machine(machineId)?.status === 'suspended' ? 'suspended' as const : null;
     if (!r) {
       return { online: false, status: held ?? 'never' as const, first_check_in_at: null, last_check_in_at: null, version: null, platform: null, node: null, git: null, clients: [],
-        auto_update: null, remote_cleanup: null, remove_connector_with_last_hub: null, usage_opt_in: null, hardware_opt_in: null, destinations: null, isolation: null, key_store: null, legacy_leftovers: null, version_status: null, update_available: null };
+        auto_update: null, remote_cleanup: null, remove_connector_with_last_hub: null, usage_opt_in: null, hardware_opt_in: null, destinations: null, isolation: null, key_store: null, legacy_leftovers: null, legacy_leftover_kinds: null, version_status: null, update_available: null };
     }
     const online = !held && this.now() - r.last_check_in_at < ONLINE_MS;
     const vs = r.version ? (this.db.prepare('SELECT status FROM connector_versions WHERE version=?').get(r.version) as { status: string } | undefined)?.status ?? null : null;
@@ -544,7 +556,7 @@ export class Connector {
       online, status: held ?? (online ? 'online' as const : 'offline' as const), first_check_in_at: r.first_check_in_at, last_check_in_at: r.last_check_in_at,
       version: r.version, platform: r.platform, node: r.node, git: r.git, clients: parse(r.clients, [] as unknown[]),
       auto_update: bool(r.auto_update), remote_cleanup: bool(r.remote_cleanup), remove_connector_with_last_hub: bool(r.remove_with_last_hub), usage_opt_in: bool(r.usage_opt_in), hardware_opt_in: bool(r.hardware_opt_in),
-      destinations: parse(r.destinations, null as { id: string; label: string }[] | null), isolation: r.isolation, key_store: r.key_store, legacy_leftovers: bool(r.legacy_leftovers),
+      destinations: parse(r.destinations, null as { id: string; label: string }[] | null), isolation: r.isolation, key_store: r.key_store, legacy_leftovers: bool(r.legacy_leftovers), legacy_leftover_kinds: parse(r.legacy_leftover_kinds, null as string[] | null),
       version_status: vs, update_available: newer.length ? newer[newer.length - 1]! : null,
     };
   }

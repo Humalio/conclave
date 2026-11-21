@@ -554,3 +554,19 @@ describe('checkpoint wording', () => {
     expect(rows.find((r) => r.id === skipped)).toMatchObject({ kind: 'checkpoint', reason: 'Submitted without review · waits for your approval' });
   });
 });
+
+describe('every option a row shows works', () => {
+  it('Later works on every row of the list, including a past-its-check-in or not-delivered row (its id says delivery, its source is the task queue)', async () => {
+    const rows = (await needs(admin)).items as any[];
+    expect(rows.some((r) => r.kind === 'overdue' || r.kind === 'undelivered')).toBe(true);
+    for (const r of rows) {
+      const x = await call(admin, 'POST', '/needs-you/dismiss', { record: r.id, episode: r.source.version, kind: 'later', until: Date.now() + 3600_000 });
+      expect([r.id, x.status, x.body?.message]).toEqual([r.id, 200, undefined]);
+    }
+  });
+  it('a dismissal accepts a long episode (the blocking rows list every blocker in theirs) and refuses a wrong one with a plain conflict, not a validation error', async () => {
+    await call(admin, 'PUT', `/projects/${cnv}/attention`, { missed_warnings: true });
+    const row = (await needs(admin)).awareness.items.find((i: any) => i.kind === 'missed_milestone');
+    expect((await call(admin, 'POST', '/needs-you/dismiss', { record: row.record, episode: 'x'.repeat(500) })).status).toBe(409);
+  });
+});

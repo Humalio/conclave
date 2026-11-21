@@ -336,10 +336,16 @@ describe('retention', () => {
     expect(app.db.prepare('SELECT 1 x FROM blobs WHERE hash=?').get(orphan.hash)).toBeUndefined();
     expect(existsSync(blobFile(kept.hash))).toBe(true);
     expect(existsSync(blobFile(fresh.hash))).toBe(true);
-    // the share retention period is configurable
+    // the share retention period can be raised, never lowered below the default (docs/operations.md, built-in rules)
     app.db.prepare("INSERT INTO system_settings(key,value,updated_at) VALUES ('retention.shares_days','1',?)").run(Date.now());
     app.db.prepare('UPDATE shares SET updated_at=? WHERE id=?').run(Date.now() - 2 * DAY, recentClosed.id);
+    expect((await app.maintenance.run()).shares).toBe(0);
+    app.db.prepare("UPDATE system_settings SET value='200' WHERE key='retention.shares_days'").run();
+    app.db.prepare('UPDATE shares SET updated_at=? WHERE id=?').run(Date.now() - 150 * DAY, recentClosed.id);
+    expect((await app.maintenance.run()).shares).toBe(0);
+    app.db.prepare('UPDATE shares SET updated_at=? WHERE id=?').run(Date.now() - 201 * DAY, recentClosed.id);
     expect((await app.maintenance.run()).shares).toBe(1);
+    app.db.prepare("DELETE FROM system_settings WHERE key='retention.shares_days'").run();
   });
 });
 
@@ -369,6 +375,11 @@ describe('bridge receive commit step', () => {
     const a = app.keys.createAgent('br-a', null, sys), b = app.keys.createAgent('br-b', null, sys);
     const sender = app.keys.createSessionKey({ agentId: a.id, label: 'sender' }, sys).credential.id;
     const receiver = app.keys.createSessionKey({ agentId: b.id, label: 'receiver' }, sys).credential.id;
+    // An agent channel relays only while both agents still hold the channel grants (docs/transfers.md).
+    for (const cred of [sender, receiver]) {
+      const policy = (app.db.prepare('SELECT policy_id p FROM credentials WHERE id=?').get(cred) as { p: string }).p;
+      app.keys.setRules(policy, [{ effect: 'allow', actions: ['channel.use'], resource: 'channel:*' }, { effect: 'allow', actions: ['channel.open', 'channel.accept'], resource: 'agent:*' }], 'test', sys);
+    }
     const id = newId.channel(), sha = 'a'.repeat(64);
     app.db.prepare("INSERT INTO data_channels(id,from_agent_id,from_credential_id,target_kind,target,to_agent_id,to_credential_id,direction,mode,from_machine_id,to_machine_id,to_local_path,size,received_offset,status,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
       .run(id, a.id, sender, 'agent', `agent:${b.id}`, b.id, receiver, 'send', 'bridge', m1, m2, 'C:\\dest\\f.bin', 10, 10, 'open', Date.now(), Date.now() + 600_000);
@@ -389,6 +400,11 @@ describe('bridge receive commit step', () => {
     const a = app.keys.createAgent('br-c', null, sys), b = app.keys.createAgent('br-d', null, sys);
     const sender = app.keys.createSessionKey({ agentId: a.id, label: 'sender' }, sys).credential.id;
     const receiver = app.keys.createSessionKey({ agentId: b.id, label: 'receiver' }, sys).credential.id;
+    // An agent channel relays only while both agents still hold the channel grants (docs/transfers.md).
+    for (const cred of [sender, receiver]) {
+      const policy = (app.db.prepare('SELECT policy_id p FROM credentials WHERE id=?').get(cred) as { p: string }).p;
+      app.keys.setRules(policy, [{ effect: 'allow', actions: ['channel.use'], resource: 'channel:*' }, { effect: 'allow', actions: ['channel.open', 'channel.accept'], resource: 'agent:*' }], 'test', sys);
+    }
     const id = newId.channel();
     app.db.prepare("INSERT INTO data_channels(id,from_agent_id,from_credential_id,target_kind,target,to_agent_id,to_credential_id,direction,mode,from_machine_id,to_machine_id,to_local_path,size,received_offset,status,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
       .run(id, a.id, sender, 'agent', `agent:${b.id}`, b.id, receiver, 'send', 'bridge', m1, m2, 'C:\\dest\\g.bin', 10, 10, 'open', Date.now(), Date.now() + 600_000);

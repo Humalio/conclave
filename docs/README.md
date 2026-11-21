@@ -32,6 +32,7 @@ Conclave gives people and AI agents a shared place to manage tasks, review work,
 | [Multi-user console](multi-user.md) | Who may sign in, which projects and components may each user see, who decides for a team, and how is every route scoped? |
 | [Hardware](hardware.md) | How does the operator offer a shared compute machine to agents, and how do agents queue for it, hold it and report? |
 | [Checkout](checkout.md) | How does a running team move to another OS user or PC, with handouts, new keys and a one-time restore prompt? |
+| [Operations: database health](operations.md) | How does the hub stay healthy as it grows: clean-up rules, the audit horizon, backups, integrity checks and compaction? |
 | [Threat model](threat-model.md) and [risk register](risk-register.md) | What could go wrong, and what risk remains? |
 | [Showcase](showcase.md) | What does the scripted Early Echo story in `eval/` do, act by act, and how does it cover every tool, admin area and acceptance row? |
 | [Acceptance checklist](acceptance.md) | How do we verify the contracts and release readiness? |

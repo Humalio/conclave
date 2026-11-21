@@ -36,7 +36,8 @@ const REASSIGN_FROM = ['assigned', 'changes_requested', 'in_progress'];
 
 /** One resolving action: the source workflow's own route. `input` actions need the source screen (a choice, a text). */
 /** noteAs: the body field the source workflow reads the operator's note from (an answer's text), when not `note`. */
-export interface NeedsAction { id: string; label: string; path: string; body?: Record<string, unknown>; input?: boolean; tone?: 'ok' | 'bad'; noteAs?: string }
+/** confirm: the question the console asks once before it acts, naming what the action ends; done: what its toast says happened. */
+export interface NeedsAction { id: string; label: string; path: string; body?: Record<string, unknown>; input?: boolean; tone?: 'ok' | 'bad'; noteAs?: string; confirm?: string; done?: string }
 /**
  * What a row needs to be decided on its own (docs/dashboard-ux.md, Needs you screen). Agent text (L2), shown escaped:
  * a question's context and options, a blocked task's reason and who blocked it, a proposal's operations.
@@ -59,6 +60,8 @@ export interface NeedsRow {
   title: string; reason: string; open: NeedsOpen; actions: NeedsAction[]; at: number;
   /** What the row needs to be decided on its own (NeedsDetail). */
   detail?: NeedsDetail;
+  /** A design to decide: the decision item's key and the review in a few words ("approved", "2 changes"), or null when it has none. */
+  design?: { key: string; review: string | null };
   /** A paused team's end time (epoch ms), shown in the viewer's own clock. */
   until?: number | null;
   /** An undelivered item's PC went offline at this time (epoch ms): the console adds "since hh:mm" in the viewer's own clock. */
@@ -165,7 +168,8 @@ export class NeedsYou {
    */
   async rows(v: Viewer, only?: string): Promise<NeedsRow[]> {
     this.projectOf.clear();
-    const want = (src: string) => !only || only === src;
+    // A row's id prefix names its source, except a delivery row (delivery:<task>), which is built with the task rows.
+    const want = (src: string) => !only || only === src || (only === 'delivery' && src === 'task');
     const out: NeedsRow[] = [];
     const scope = (team_id: string | null) => ({ project_id: this.teamProject(team_id), team_id });
     // Routing per team, read once: a member's teams, or for the admin the teams with no active decider.
@@ -177,11 +181,11 @@ export class NeedsYou {
     // Questions for this decider (open), and relayed answers waiting to be confirmed; a question waiting for the agent's
     // reply (needs_info) is the agent's, not the viewer's.
     type Q = { id: string; team_id: string; agent_id: string; question: string; status: string; relay_state: string | null; escalated_at: number | null; created_at: number; updated_at: number; relayed_at: number | null;
-      context: string | null; options: string; recommended: string | null; task_id: string | null; task_title: string | null };
+      context: string | null; options: string; recommended: string | null; refs: string; task_id: string | null; task_title: string | null };
     // A requirement marked unclear is one team question (docs/blueprint.md §2.7): the ask's row is the item's, and answering it clears the mark.
     const unclearOf = new Map<string, Un & { unclear_ask: string }>();
     for (const x of this.db.prepare("SELECT project_id, key, title, body, rev, fields, json_extract(fields,'$.unclear_ask') AS unclear_ask FROM bp_items WHERE kind IN ('fr','nfr') AND deleted_at IS NULL AND json_extract(fields,'$.unclear')=1 AND json_extract(fields,'$.unclear_ask') IS NOT NULL").all() as (Un & { unclear_ask: string })[]) unclearOf.set(x.unclear_ask, x);
-    if (want('question')) for (const q of this.db.prepare("SELECT d.id, d.team_id, d.agent_id, d.question, d.status, d.relay_state, d.escalated_at, d.created_at, d.updated_at, d.relayed_at, d.context, d.options, d.recommended, d.task_id, k.title AS task_title FROM decisions d LEFT JOIN tasks k ON k.id=d.task_id WHERE d.status='open' OR d.relay_state='pending'").all() as Q[]) {
+    if (want('question')) for (const q of this.db.prepare("SELECT d.id, d.team_id, d.agent_id, d.question, d.status, d.relay_state, d.escalated_at, d.created_at, d.updated_at, d.relayed_at, d.context, d.options, d.recommended, d.refs, d.task_id, k.title AS task_title FROM decisions d LEFT JOIN tasks k ON k.id=d.task_id WHERE d.status='open' OR d.relay_state='pending'").all() as Q[]) {
       if (!(routedHere(q.team_id) || (v.isAdmin && q.escalated_at !== null))) continue;
       const relay = q.relay_state === 'pending';
       const un = !relay ? unclearOf.get(q.id) : undefined;
@@ -194,6 +198,23 @@ export class NeedsYou {
           at: q.created_at, by: this.agentName(q.agent_id), summary: q.question,
           ask: { id: q.id, question: q.question, team_id: q.team_id, team_label: this.teamName(q.team_id), asked_at: q.created_at, version: String(q.updated_at) },
           item: itemOf(un),
+        });
+        continue;
+      }
+      // A question that names a design (a decision item) is one row, "Design to decide", in place of its ordinary question row (docs/decisions.md, Designs).
+      const des = this.d.blueprint?.designOf(q.team_id, JSON.parse(q.refs) as string[]);
+      if (des && ['proposed', 'accepted', 'rejected'].includes(des.item.status ?? '')) {
+        const rv = (des.item.fields['review'] && typeof des.item.fields['review'] === 'object' ? des.item.fields['review'] : null) as { verdict?: string; changes?: unknown } | null;
+        const n = Array.isArray(rv?.changes) ? (rv!.changes as unknown[]).length : 0;
+        out.push({
+          id: `question:${q.id}`, kind: 'design', source: { kind: 'decision', id: q.id, version: String(q.updated_at) }, scope: scope(q.team_id),
+          title: `Design to decide · ${des.item.title}`, reason: relay ? `${this.agentName(q.agent_id)} relayed an answer · confirm or overturn it` : `${this.agentName(q.agent_id)} asks${this.teamName(q.team_id) === 'A team' ? '' : ` for ${this.teamName(q.team_id)}`}`,
+          open: { kind: 'design', id: q.id, team_id: q.team_id },
+          actions: relay ? [{ id: 'confirm', label: 'Confirm', path: `/api/decisions/${enc(q.id)}/confirm`, tone: 'ok' }, { id: 'overturn', label: 'Overturn', path: `/api/decisions/${enc(q.id)}/overturn`, input: true }]
+            : [{ id: 'answer', label: 'Decide', path: `/api/decisions/${enc(q.id)}/answer`, input: true }],
+          at: relay ? (q.relayed_at ?? q.updated_at) : q.created_at, by: this.agentName(q.agent_id), summary: q.question,
+          detail: { kind: 'question', context: null, options: qOptions(q.options), recommended: q.recommended, blocks: q.task_id ? { id: q.task_id, title: q.task_title ?? q.task_id } : null, asked_by: this.agentName(q.agent_id) },
+          design: { key: des.item.key, review: rv ? (des.stale ? 'out of date' : rv.verdict === 'approved' ? 'approved' : `${n} change${n === 1 ? '' : 's'}`) : null },
         });
         continue;
       }
@@ -310,6 +331,16 @@ export class NeedsYou {
         reason: q.kind === 'vault_agent' ? 'One agent for shared folders, no team' : `${q.kind === 'new_team' ? 'A new team' : 'More agents'}, ${q.agents} agent${q.agents === 1 ? '' : 's'}`,
         open: { kind: 'onboarding', id: q.id },
         actions: [{ id: 'approve', label: 'Approve', path: `/api/onboarding/${enc(q.id)}/approve`, input: true }, { id: 'deny', label: 'Deny', path: `/api/onboarding/${enc(q.id)}/deny`, tone: 'bad' }], at: q.waiting_since ?? q.filed_at });
+    }
+    // "Paired just now" (docs/onboarding.md#paired-just-now): a connector redeemed a PC's code. It stays until the operator
+    // says it was them, or revokes the pairing, which also cancels the PC's requests and revokes the keys picked up with it.
+    if (want('paired')) for (const x of this.d.onboarding?.newPairings() ?? []) {
+      const pc = x.pc_name ?? 'a PC';
+      out.push({ id: `paired:${x.id}`, kind: 'paired', source: { kind: 'connector_pairing', id: x.id, version: 'new' }, scope: { project_id: null, team_id: null },
+        title: `${pc} paired just now`, reason: [`From ${x.source ?? 'an unknown address'}`, x.version ? `connector ${x.version}` : null, x.platform].filter(Boolean).join(' · '),
+        open: { kind: 'pc', id: x.machine_id }, summary: `If this wasn't the PC you added, revoke it: its connector key, its open requests and any agent keys it picked up stop at once.`,
+        actions: [{ id: 'keep', label: 'It was me', path: `/api/pairings/${enc(x.id)}/keep`, tone: 'ok' }, { id: 'revoke', label: 'Revoke', path: `/api/pairings/${enc(x.id)}/revoke`, tone: 'bad',
+          confirm: "Revoke this PC's pairing? Its agents stop connecting.", done: `Pairing revoked for ${pc}` }], at: x.paired_at });
     }
     if (want('checkout')) for (const c of (await this.d.checkouts?.().catch(() => []) ?? [])) for (const x of c.needs_operator) {
       out.push({ id: `checkout:${c.id}:${x.kind}${x.agent_id ? ':' + x.agent_id : ''}`, kind: 'checkout', source: { kind: 'checkout', id: c.id, version: `${x.kind}:${x.count ?? ''}` }, scope: scope(c.team_id),

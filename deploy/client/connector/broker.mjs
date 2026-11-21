@@ -160,7 +160,13 @@ export async function startBroker({ home, log = () => {}, deps = {} }) {
     }
   }
 
-  if (!WIN) { try { mkdirSync(join(address, '..'), { recursive: true, mode: 0o700 }); rmSync(address, { force: true }); } catch { /* listen reports it */ } }
+  if (!WIN) {
+    try { mkdirSync(join(address, '..'), { recursive: true, mode: 0o700 }); } catch { /* listen reports it */ }
+    // A socket file left by a broker that died is removed; one a live broker still answers on is not: a second start fails and leaves it (and its secret) alone.
+    const live = await new Promise((res) => { const c = net.connect(address); c.once('connect', () => { c.destroy(); res(true); }); c.once('error', () => res(false)); });
+    if (live) throw Object.assign(new Error('the broker address is taken by a running broker'), { code: 'EADDRINUSE' });
+    try { rmSync(address, { force: true }); } catch { /* listen reports it */ }
+  }
   const server = net.createServer((sock) => {
     let buf = '';
     sock.setEncoding('utf8');
